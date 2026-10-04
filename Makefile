@@ -12,7 +12,7 @@ APP ?= bq_to_gcs_helpers
 PROJECT_ID ?= jag-pgsql-gke
 IMAGE_TAG ?= local
 REGION ?= us-central1
-AR_REPOSITORY ?= cloud-run
+AR_REPOSITORY ?= cloud-run-source-deploy
 RUN_ENV_VARS ?=
 RUN_SECRETS ?=
 

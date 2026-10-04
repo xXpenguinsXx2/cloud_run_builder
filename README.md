@@ -65,7 +65,7 @@ Create a Cloud Build trigger with:
 - Repository source set to this repository's root.
 - Configuration file `cloudbuild.yaml` at the repository root.
 - Branch filters for `dev`, `stage`, `prod`, and `main` (or a broader filter if desired).
-- Substitutions `_REGION` and `_AR_REPOSITORY` set to the Artifact Registry location and Docker repository. Defaults are `us-central1` and `cloud-run`.
+- Substitutions `_REGION` and `_AR_REPOSITORY` set to the Artifact Registry location and Docker repository. Defaults are `us-central1` and `cloud-run-source-deploy`.
 - Substitution `_RUNTIME_SERVICE_ACCOUNT` selects the Cloud Run runtime identity. It defaults to the project's Compute Engine default service account; change this single substitution in `cloudbuild.yaml` or the trigger to switch to a non-default account.
 - A dedicated Cloud Build service account as the trigger's build identity.
 

@@ -27,7 +27,7 @@ steps:
 
 substitutions:
   _REGION: us-central1
-  _AR_REPOSITORY: cloud-run
+  _AR_REPOSITORY: cloud-run-source-deploy
   _RUNTIME_SERVICE_ACCOUNT: 45358069937-compute@developer.gserviceaccount.com
 
 options:
