@@ -1,0 +1,1 @@
+-r ../apps/bq_to_gcs_helpers/requirements.txt
