@@ -62,13 +62,14 @@ Run handler-level checks without Google Cloud access with `make test`. Install t
 
 Create a Cloud Build trigger with:
 
-- Repository source set to this repository and the `cloud_run_builder` directory as its build configuration directory.
-- Configuration file `cloudbuild.yaml`.
+- Repository source set to this repository's root.
+- Configuration file `cloudbuild.yaml` at the repository root.
 - Branch filters for `dev`, `stage`, `prod`, and `main` (or a broader filter if desired).
 - Substitutions `_REGION` and `_AR_REPOSITORY` set to the Artifact Registry location and Docker repository. Defaults are `us-central1` and `cloud-run`.
+- Substitution `_RUNTIME_SERVICE_ACCOUNT` selects the Cloud Run runtime identity. It defaults to the project's Compute Engine default service account; change this single substitution in `cloudbuild.yaml` or the trigger to switch to a non-default account.
 - A dedicated Cloud Build service account as the trigger's build identity.
 
-Branches `dev`, `stage`, and `prod` select the same-named app config. `main` selects `prod`. Other branches fail closed. Apps without a matching environment config are ignored; if no configured app is found, the build fails with a message. Images are tagged with the commit SHA and the deployed revision uses that exact tag.
+Branches `dev`, `stage`, and `prod` select the same-named app config. `main` selects `prod`. Other branches fail closed. The BigQuery-to-GCS production profile uses project `jag-pgsql-gke`, region `us-central1`, bucket `jag_bq_export_bucket`, and service `bigquery-gcs-export`; dataset and table remain request fields. Apps without a matching environment config are ignored; if no configured app is found, the build fails with a message. Images are tagged with the commit SHA and the deployed revision uses that exact tag.
 
 ## IAM and secrets
 

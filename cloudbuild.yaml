@@ -1,7 +1,6 @@
 steps:
   - id: build-and-push-app-images
     name: gcr.io/cloud-builders/docker
-    dir: cloud_run_builder
     entrypoint: bash
     args: ["./scripts/build.sh"]
     env:
@@ -11,10 +10,10 @@ steps:
       - "BUILD_ID=$BUILD_ID"
       - "DEPLOY_REGION=$_REGION"
       - "AR_REPOSITORY=$_AR_REPOSITORY"
+      - "CLOUD_RUN_SERVICE_ACCOUNT=$_RUNTIME_SERVICE_ACCOUNT"
 
   - id: deploy-apps-to-cloud-run
     name: gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
-    dir: cloud_run_builder
     entrypoint: bash
     args: ["./scripts/deploy.sh"]
     env:
@@ -24,10 +23,12 @@ steps:
       - "BUILD_ID=$BUILD_ID"
       - "DEPLOY_REGION=$_REGION"
       - "AR_REPOSITORY=$_AR_REPOSITORY"
+      - "CLOUD_RUN_SERVICE_ACCOUNT=$_RUNTIME_SERVICE_ACCOUNT"
 
 substitutions:
   _REGION: us-central1
   _AR_REPOSITORY: cloud-run
+  _RUNTIME_SERVICE_ACCOUNT: 45358069937-compute@developer.gserviceaccount.com
 
 options:
   logging: CLOUD_LOGGING_ONLY
