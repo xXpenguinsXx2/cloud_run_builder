@@ -1,1 +1,2 @@
 -r ../apps/bq_to_gcs_helpers/requirements.txt
+-r ../apps/gcs_to_postgresql_helpers/requirements.txt

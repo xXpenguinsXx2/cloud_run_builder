@@ -64,7 +64,22 @@ def response_body(response):
         return response.text
 
 
+def find_matching_export_blobs(storage_client, bucket_name, object_pattern):
+    prefix = object_pattern.split("*", 1)[0]
+    matching_blobs = [
+        blob
+        for blob in storage_client.list_blobs(bucket_name, prefix=prefix)
+        if (
+            fnmatch.fnmatchcase(blob.name, object_pattern)
+            if "*" in object_pattern
+            else blob.name == object_pattern
+        )
+    ]
+    return sorted(matching_blobs, key=lambda blob: blob.name)
+
+
 def run_validation_smoke_test(function_url, timeout_seconds):
+    print(f"Checking local function readiness at {function_url.rstrip('/')}/")
     response = requests.post(
         f"{function_url.rstrip('/')}/", json={}, timeout=timeout_seconds
     )
@@ -144,7 +159,7 @@ def load_export_request():
     return payload
 
 
-def run_export_smoke_test(function_url, timeout_seconds):
+def run_export_smoke_test(function_url, timeout_seconds, request_headers=None):
     payload = load_export_request()
     if payload is None:
         return 2
@@ -192,23 +207,64 @@ def run_export_smoke_test(function_url, timeout_seconds):
     print(f"Calling export function at {function_url.rstrip('/')}/")
 
     response = requests.post(
-        f"{function_url.rstrip('/')}/", json=payload, timeout=timeout_seconds
+        f"{function_url.rstrip('/')}/",
+        json=payload,
+        timeout=timeout_seconds,
+        headers=request_headers,
     )
     body = response_body(response)
+    object_pattern = payload.get("destination_object", f"{payload['table_id']}.csv")
+    expected_destination = (
+        f"gs://{payload['destination_bucket']}/"
+        f"{object_pattern}"
+    )
 
     if (
         response.status_code != 200
         or not isinstance(body, dict)
         or body.get("status") != "success"
+        or body.get("destination") != expected_destination
     ):
         print(f"FAIL: export request returned HTTP {response.status_code}: {body}")
         return 1
 
     print(
-        f"PASS: exported {body['exported']} to {body['destination']} "
-        f"as {principal}."
+        f"PASS: function reports BigQuery extract completed for {body['exported']} "
+        f"to {body['destination']} as {principal}."
+    )
+
+    try:
+        storage_client = storage.Client(
+            project=payload["source_project"], credentials=credentials
+        )
+        matching_blobs = find_matching_export_blobs(
+            storage_client, payload["destination_bucket"], object_pattern
+        )
+    except (GoogleAuthError, GoogleAPIError) as exc:
+        print(f"FAIL: could not verify exported GCS objects: {exc}")
+        return 2
+
+    if not matching_blobs:
+        print(
+            "FAIL: no GCS objects match "
+            f"gs://{payload['destination_bucket']}/{object_pattern}"
+        )
+        return 1
+
+    print(
+        f"PASS: found {len(matching_blobs)} exported object(s) at "
+        f"gs://{payload['destination_bucket']}/: "
+        + ", ".join(blob.name for blob in matching_blobs)
     )
     return 0
+
+
+def run_local_export_smoke_test(function_url, timeout_seconds):
+    readiness_result = run_validation_smoke_test(function_url, timeout_seconds)
+    if readiness_result != 0:
+        return readiness_result
+
+    return run_export_smoke_test(function_url, timeout_seconds)
 
 
 def run_import_smoke_test():
@@ -276,21 +332,13 @@ def run_import_smoke_test():
 
         storage_client = storage.Client(project=project_id, credentials=credentials)
         bucket_name = payload["destination_bucket"]
-        prefix = object_pattern.split("*", 1)[0]
         print(
             f"Looking for GCS objects: gs://{bucket_name}/{object_pattern}",
             flush=True,
         )
-        matching_blobs = [
-            blob
-            for blob in storage_client.list_blobs(bucket_name, prefix=prefix)
-            if (
-                fnmatch.fnmatchcase(blob.name, object_pattern)
-                if "*" in object_pattern
-                else blob.name == object_pattern
-            )
-        ]
-        matching_blobs.sort(key=lambda blob: blob.name)
+        matching_blobs = find_matching_export_blobs(
+            storage_client, bucket_name, object_pattern
+        )
         if not matching_blobs:
             raise ValueError(
                 f"no GCS objects match gs://{bucket_name}/{object_pattern}"
@@ -487,9 +535,14 @@ def main():
             return run_validation_smoke_test(function_url, timeout_seconds)
         if mode == "export":
             return run_export_smoke_test(function_url, timeout_seconds)
+        if mode == "local-export":
+            return run_local_export_smoke_test(function_url, timeout_seconds)
         if mode == "import":
             return run_import_smoke_test()
-        print("FAIL: SMOKE_TEST_MODE must be 'validation', 'export', or 'import'.")
+        print(
+            "FAIL: SMOKE_TEST_MODE must be 'validation', 'export', "
+            "'local-export', or 'import'."
+        )
         return 2
     except requests.RequestException as exc:
         print(f"FAIL: could not call the function at {function_url}: {exc}")

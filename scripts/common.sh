@@ -34,7 +34,7 @@ load_app_config() {
     return 1
   fi
 
-  unset SERVICE_NAME RUNTIME_SERVICE_ACCOUNT RUN_ENV_VARS RUN_SECRETS
+  unset SERVICE_NAME RUNTIME_SERVICE_ACCOUNT RUN_ENV_VARS RUN_SECRETS CLOUD_SQL_CONNECTION_NAME RUN_TIMEOUT_SECONDS
   # Config files are maintained alongside the app and contain shell assignments.
   # shellcheck disable=SC1090
   source "$config_file"

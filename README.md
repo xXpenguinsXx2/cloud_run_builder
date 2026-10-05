@@ -52,9 +52,29 @@ make -C dev_test_apps list
 make -C dev_test_apps build-all
 make -C dev_test_apps run DEV_TEST_APP=postgres
 make -C dev_test_apps run DEV_TEST_APP=smoke_tests
+make -C dev_test_apps smoke-test-export-local
+make -C dev_test_apps smoke-test-export-remote
 ```
 
 `run` builds the selected image first, then runs it in the foreground with `--rm`; use Ctrl+C to stop it. Override `DEV_TEST_RUN_ARGS` to pass Docker options or environment values to the selected container. The smoke runner expects its HTTP handler at `localhost:8080` by default. PostgreSQL's sample credentials are for local testing only.
+
+`smoke-test-export-local` first checks that the local function at `http://127.0.0.1:8080` is responding with its expected validation response. It then reads the CSV request from `dev_test_apps/smoke_tests/export-request.json` and the Parquet/SNAPPY request from `dev_test_apps/smoke_tests/export-request-parquet.json`. For each request, it checks that the configured BigQuery dataset and table exist and that the location matches, then triggers the export. Start the local function and authenticate with Google Application Default Credentials first. Override the endpoint with `LOCAL_FUNCTION_URL` if needed.
+
+`smoke-test-export-remote` gets the deployed Cloud Run URL with `gcloud run services describe` and calls it directly using a `gcloud auth print-identity-token` bearer token; it does not require the Cloud Run proxy component or a local function. It runs once for CSV and once for Parquet/SNAPPY, performs the same BigQuery dataset/table and location preflight using the corresponding request JSON files, and writes to separate `example/cloud-run-export-*.csv` and `example/cloud-run-export-*.parquet` object patterns. Authenticate with both `gcloud` and Google Application Default Credentials first; the authenticated identity must have permission to invoke the Cloud Run service. Override `PROJECT_ID`, `REGION`, `SERVICE_NAME`, or `SOURCE_PROJECT` as needed.
+
+## GCS to PostgreSQL importer
+
+`apps/gcs_to_postgresql_helpers/` contains a private Cloud Run HTTP function that imports CSV or Parquet GCS exports into PostgreSQL. It reads the source BigQuery schema, imports objects matching `destination_object`, and transactionally replaces `public.<table_id>` for CSV or `public.parq_<table_id>` for Parquet. It uses Cloud SQL IAM database authentication when `CLOUD_SQL_CONNECTION_NAME` is configured, and a direct TCP connection for local development.
+
+For local testing, authenticate with Google Application Default Credentials and run from `cloud_run_builder`:
+
+```powershell
+make -C dev_test_apps local-import
+```
+
+This starts a local PostgreSQL container on port 5433 and the importer on port 8081, imports the CSV and Parquet objects matched by `dev_test_apps/smoke_tests/import-request-csv.json` and `dev_test_apps/smoke_tests/import-request-parquet.json`, then checks the resulting table row counts. The import requests point at the `example/cloud-run-export-*` objects produced by the remote export smoke test; run `make -C dev_test_apps smoke-test-export-remote` first if those objects are missing. The PostgreSQL volume persists between runs. Stop the local services with `make -C dev_test_apps local-import-postgres-down`.
+
+Before deploying, replace the Cloud SQL connection name and database-name placeholders in the selected `apps/gcs_to_postgresql_helpers/deploy/<environment>.env` file. Enable the Cloud SQL Admin API and IAM database authentication, add the Cloud Run runtime service account as a Cloud SQL IAM database user, grant it Cloud SQL Client and Cloud SQL Instance User access, and grant that database user the schema/table privileges needed to replace the import tables. The deployment sets `DB_IAM_USER` to the runtime service account, attaches the configured instance to Cloud Run, passes its connection name to the service, and sets a one-hour request timeout. Select `CLOUD_SQL_IP_TYPE=PRIVATE` and configure Cloud Run VPC connectivity if the instance is private-IP-only. Grant the runtime identity BigQuery Data Viewer and Storage Object Viewer on the source table and bucket.
 
 Run handler-level checks without Google Cloud access with `make test`. Install the app dependencies first with `make test-deps` if they are not already available in the selected Python environment.
 

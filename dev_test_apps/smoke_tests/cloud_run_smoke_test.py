@@ -1,51 +1,57 @@
 import argparse
 import os
-import socket
 import subprocess
 import sys
-import time
+
+import requests
 
 from smoke_test import run_export_smoke_test
 
 
-def proxy_is_listening(port):
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            return True
-    except OSError:
-        return False
-
-
-def wait_for_proxy(process, port, timeout_seconds):
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if process is not None and process.poll() is not None:
-            raise RuntimeError(
-                f"Cloud Run proxy exited early with code {process.returncode}"
-            )
-        if proxy_is_listening(port):
-            return
-        time.sleep(1)
-    raise TimeoutError(f"Cloud Run proxy did not listen on port {port} in time")
-
-
-def stop_proxy(process):
-    if process.poll() is not None:
-        return
+def run_gcloud_command(gcloud, *arguments):
+    command = [gcloud, *arguments]
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            check=False,
-            capture_output=True,
-            text=True,
+        command = ["cmd.exe", "/d", "/c", subprocess.list2cmdline(command)]
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"gcloud {' '.join(arguments)} failed"
+            + (f": {detail}" if detail else f" with exit code {result.returncode}")
         )
-    else:
-        process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+    return result.stdout.strip()
+
+
+def get_cloud_run_service_url(gcloud, project, region, service):
+    service_url = run_gcloud_command(
+        gcloud,
+        "run",
+        "services",
+        "describe",
+        service,
+        f"--project={project}",
+        f"--region={region}",
+        "--format=value(status.url)",
+    )
+    if not service_url.startswith("https://"):
+        raise RuntimeError(
+            f"gcloud returned an invalid URL for Cloud Run service {service}: "
+            f"{service_url or '(empty)'}"
+        )
+    return service_url
+
+
+def get_identity_token(gcloud):
+    token = run_gcloud_command(gcloud, "auth", "print-identity-token")
+    if not token:
+        raise RuntimeError("gcloud auth print-identity-token returned an empty token")
+    return token
 
 
 def main():
@@ -56,8 +62,6 @@ def main():
     parser.add_argument("--service", required=True)
     parser.add_argument("--source-project", required=True)
     parser.add_argument("--format", choices=("CSV", "PARQUET"), required=True)
-    parser.add_argument("--port", type=int, default=18080)
-    parser.add_argument("--skip-proxy", action="store_true")
     args = parser.parse_args()
 
     os.environ["SMOKE_TEST_SOURCE_PROJECT"] = args.source_project
@@ -73,55 +77,24 @@ def main():
             "example/cloud-run-export-*.csv"
         )
 
-    proxy = None
-    if args.skip_proxy:
-        print(
-            f"Using existing Cloud Run proxy for {args.service} "
-            f"at localhost:{args.port}; no proxy launch performed.",
-            flush=True,
-        )
-    elif proxy_is_listening(args.port):
-        print(
-            f"Detected existing Cloud Run proxy for {args.service} "
-            f"at localhost:{args.port}; reusing it.",
-            flush=True,
-        )
-    else:
-        proxy_args = [
-            args.gcloud,
-            "run",
-            "services",
-            "proxy",
-            args.service,
-            f"--project={args.project}",
-            f"--region={args.region}",
-            f"--port={args.port}",
-        ]
-        if os.name == "nt":
-            proxy_command = ["cmd.exe", "/d", "/c", subprocess.list2cmdline(proxy_args)]
-        else:
-            proxy_command = proxy_args
-
-        print(
-            f"Starting authenticated Cloud Run proxy for {args.service} "
-            f"in {args.project}/{args.region} on localhost:{args.port}.",
-            flush=True,
-        )
-        proxy = subprocess.Popen(proxy_command)
-
     try:
-        wait_for_proxy(proxy, args.port, timeout_seconds=60)
-        print("Cloud Run proxy is ready; running BigQuery preflight and export.", flush=True)
-        return run_export_smoke_test(
-            f"http://127.0.0.1:{args.port}",
-            float(os.environ.get("SMOKE_TEST_TIMEOUT_SECONDS", "600")),
+        service_url = get_cloud_run_service_url(
+            args.gcloud, args.project, args.region, args.service
         )
-    except (OSError, RuntimeError, TimeoutError) as exc:
-        print(f"FAIL: Cloud Run smoke-test proxy failed: {exc}")
+        token = get_identity_token(args.gcloud)
+        print(
+            f"Calling deployed Cloud Run service {args.service} at {service_url}; "
+            "no proxy component is required.",
+            flush=True,
+        )
+        return run_export_smoke_test(
+            service_url,
+            float(os.environ.get("SMOKE_TEST_TIMEOUT_SECONDS", "600")),
+            request_headers={"Authorization": f"Bearer {token}"},
+        )
+    except (OSError, requests.RequestException, RuntimeError, ValueError) as exc:
+        print(f"FAIL: Cloud Run smoke test could not authenticate or resolve service: {exc}")
         return 2
-    finally:
-        if proxy is not None:
-            stop_proxy(proxy)
 
 
 if __name__ == "__main__":

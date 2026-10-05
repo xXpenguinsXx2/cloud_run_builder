@@ -15,6 +15,10 @@ REGION ?= us-central1
 AR_REPOSITORY ?= cloud-run-source-deploy
 RUN_ENV_VARS ?=
 RUN_SECRETS ?=
+CLOUD_SQL_CONNECTION_NAME ?=
+RUN_TIMEOUT_SECONDS ?=
+comma := ,
+DEPLOY_ENV_VARS = $(strip $(RUN_ENV_VARS)$(if $(strip $(CLOUD_SQL_CONNECTION_NAME)),$(if $(strip $(RUN_ENV_VARS)),$(comma))CLOUD_SQL_CONNECTION_NAME=$(CLOUD_SQL_CONNECTION_NAME)))
 
 DEPLOY_ENV ?= dev
 
@@ -48,7 +52,7 @@ push: check-project build
 	docker push "$(REMOTE_IMAGE)"
 
 deploy: check-deploy push
-	$(GCLOUD) run deploy "$(SERVICE_NAME)" --project="$(PROJECT_ID)" --region="$(REGION)" --image="$(REMOTE_IMAGE)" --service-account="$(RUNTIME_SERVICE_ACCOUNT)" --no-allow-unauthenticated --quiet $(if $(strip $(RUN_ENV_VARS)),--update-env-vars="$(RUN_ENV_VARS)") $(if $(strip $(RUN_SECRETS)),--update-secrets="$(RUN_SECRETS)")
+	$(GCLOUD) run deploy "$(SERVICE_NAME)" --project="$(PROJECT_ID)" --region="$(REGION)" --image="$(REMOTE_IMAGE)" --service-account="$(RUNTIME_SERVICE_ACCOUNT)" --no-allow-unauthenticated --quiet $(if $(strip $(DEPLOY_ENV_VARS)),--update-env-vars="$(DEPLOY_ENV_VARS)") $(if $(strip $(RUN_SECRETS)),--update-secrets="$(RUN_SECRETS)") $(if $(strip $(CLOUD_SQL_CONNECTION_NAME)),--add-cloudsql-instances="$(CLOUD_SQL_CONNECTION_NAME)") $(if $(strip $(RUN_TIMEOUT_SECONDS)),--timeout="$(RUN_TIMEOUT_SECONDS)")
 
 check-project:
 	$(if $(strip $(PROJECT_ID)),,$(error PROJECT_ID is required, for example make push PROJECT_ID=my-project))
