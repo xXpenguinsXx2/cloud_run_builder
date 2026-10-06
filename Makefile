@@ -13,6 +13,10 @@ PROJECT_ID ?= jag-pgsql-gke
 IMAGE_TAG ?= local
 REGION ?= us-central1
 AR_REPOSITORY ?= cloud-run-source-deploy
+# No default: pass explicitly, e.g. `make deploy RUNTIME_SERVICE_ACCOUNT=name@project.iam.gserviceaccount.com`.
+# This is independent of cloudbuild.yaml's _RUNTIME_SERVICE_ACCOUNT substitution, which only applies to
+# Cloud Build-triggered deploys, not this local/manual `make` workflow.
+RUNTIME_SERVICE_ACCOUNT ?=
 RUN_ENV_VARS ?=
 RUN_SECRETS ?=
 CLOUD_SQL_CONNECTION_NAME ?=
