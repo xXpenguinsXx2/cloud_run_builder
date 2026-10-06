@@ -6,21 +6,9 @@ The function reads the BigQuery table schema to create the PostgreSQL table. It 
 
 ## Local import test
 
-From `cloud_run_builder`, authenticate with Google Application Default Credentials and run:
+See [dev_test_apps/README.md](../../dev_test_apps/README.md#local-import-workflow-gcs_to_postgresql_helpers) for the full `make -C dev_test_apps local-import` workflow (Docker Compose, auth prerequisites, row-count verification, and teardown). The local database is available at `localhost:5433` with the test-only credentials `testuser` / `testpass` and database `testdb`; the importer is available at `http://localhost:8081`. The local importer container mounts the user's gcloud configuration read-only and uses Application Default Credentials for BigQuery schema lookup and GCS reads — the identity needs BigQuery Data Viewer access to the source table and Storage Object Viewer access to the bucket.
 
-```powershell
-make -C dev_test_apps local-import
-```
-
-This starts local PostgreSQL and the importer in Docker Compose, imports the configured CSV and Parquet requests, then checks the imported tables. The local database is available at `localhost:5433` with the test-only credentials `testuser` / `testpass` and database `testdb`. The importer is available at `http://localhost:8081`. Its database volume persists between runs; stop the services with:
-
-```powershell
-make -C dev_test_apps local-import-postgres-down
-```
-
-The local import requests in `dev_test_apps/smoke_tests/import-request-csv.json` and `import-request-parquet.json` consume `example/cloud-run-export-*` objects. Run the remote export smoke test first if those objects are not present.
-
-The local importer container mounts the user's gcloud configuration read-only and uses Application Default Credentials for BigQuery schema lookup and GCS reads. The identity needs BigQuery Data Viewer access to the source table and Storage Object Viewer access to the bucket.
+Handler-level unit tests (no Google Cloud access required) live in [smoke_tests/test_gcs_to_postgresql_helpers.py](../../smoke_tests/test_gcs_to_postgresql_helpers.py) at the repository root and run via `make test` (see [repository README](../../README.md#local-wrapper-commands)).
 
 ## Cloud SQL deployment
 
@@ -30,8 +18,8 @@ The Cloud Run deployment uses the Cloud SQL Python Connector with automatic IAM 
 - `DB_NAME`: the Cloud SQL database name
 - `RUNTIME_SERVICE_ACCOUNT`: set through the Cloud Build trigger as described in the repository README
 
-The deployment sets `DB_IAM_USER` to the configured runtime service account email. Add that service account to the Cloud SQL instance as an IAM database user, grant it `roles/cloudsql.client` and `roles/cloudsql.instanceUser`, and grant the database user the schema/table privileges needed to create, insert, drop, and replace import tables. For private-IP-only instances, set `CLOUD_SQL_IP_TYPE=PRIVATE` and configure Cloud Run VPC connectivity. The runtime identity also needs BigQuery Data Viewer and Storage Object Viewer permissions.
+The deployment derives `DB_IAM_USER` automatically from the configured runtime service account email, stripping its `.gserviceaccount.com` suffix — Cloud SQL's IAM database username for a service account is its email address with that suffix removed, not the full email. Add that truncated username to the Cloud SQL instance as an IAM database user (matching the full service account's identity), grant it `roles/cloudsql.client` and `roles/cloudsql.instanceUser`, and grant the database user the schema/table privileges needed to create, insert, drop, and replace import tables. For private-IP-only instances, set `CLOUD_SQL_IP_TYPE=PRIVATE` and configure Cloud Run VPC connectivity. The runtime identity also needs BigQuery Data Viewer and Storage Object Viewer permissions.
 
-Enable the Cloud SQL Admin API and IAM database authentication on the instance. The IAM database username for a service account is its full email address. The deployment attaches the instance, exposes its connection name to the service, and sets the request timeout to one hour.
+Enable the Cloud SQL Admin API and IAM database authentication on the instance. The deployment attaches the instance, exposes its connection name to the service, and sets the request timeout to one hour.
 
 The HTTP service is private by default. Callers must be granted Cloud Run Invoker access. Send a JSON `POST` request using the export-request fields to import the specified files.

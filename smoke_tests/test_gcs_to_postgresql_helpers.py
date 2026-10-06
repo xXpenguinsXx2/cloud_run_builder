@@ -71,7 +71,7 @@ class GcsToPostgresqlFunctionTests(unittest.TestCase):
         storage_client_factory.return_value.list_blobs.return_value = [blob]
 
         connection = MagicMock()
-        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor = connection.cursor.return_value
         database_connection_factory.return_value = (connection, None)
 
         response, status = self.call_handler(

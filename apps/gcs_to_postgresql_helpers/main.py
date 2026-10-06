@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from flask import Request, jsonify
@@ -246,7 +247,7 @@ def import_objects(
 
     imported_rows = 0
     try:
-        with connection.cursor() as cursor:
+        with closing(connection.cursor()) as cursor:
             cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_identifier}")
             cursor.execute(create_statement)
             for blob in blobs:

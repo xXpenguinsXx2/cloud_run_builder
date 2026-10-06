@@ -1,6 +1,14 @@
-# BigQuery → GCS Cloud Function
+# BigQuery → GCS exporter
 
-This project creates a Google Cloud Function that exports a BigQuery table to a Cloud Storage bucket. It supports a source table in a different GCP project than the project that hosts the function.
+This private Cloud Run HTTP function exports a BigQuery table to a Cloud Storage bucket as CSV or Parquet. It supports a source table in a different GCP project than the project that hosts the service. `functions-framework` serves the handler over HTTP inside the container, the same pattern used by `apps/gcs_to_postgresql_helpers`.
+
+Request fields (JSON body or query parameters):
+
+- `source_project`, `dataset_id`, `table_id` — the BigQuery table to export.
+- `destination_bucket`, `destination_object` — the destination GCS bucket and object path/pattern.
+- `location` — optional, defaults to `US`; must match the BigQuery dataset location.
+- `format` — optional, defaults to `CSV`; also supports `PARQUET`/other BigQuery extract formats.
+- `compression` — optional BigQuery extract compression (for example `SNAPPY`).
 
 ## Run locally with Docker
 
@@ -27,72 +35,32 @@ docker run --rm -p 8080:8080 `
   bigquery-gcs-export
 ```
 
-Then POST the same JSON body shown in [Call the function](#4-call-the-function) to `http://localhost:8080`. The authenticated identity needs the BigQuery and Storage permissions listed below.
+Then POST the same JSON body shown in [Call the function](#call-the-function) to `http://localhost:8080`. The authenticated identity needs the BigQuery and Storage permissions listed below.
 
-## 1) Prerequisites
+Handler-level unit tests (no Google Cloud access required) live in the root-level [smoke_tests/](../../smoke_tests/) directory and run via `make test` (see [repository README](../../README.md#local-wrapper-commands)); don't confuse that directory with [dev_test_apps/smoke_tests/](../../dev_test_apps/smoke_tests/), which holds the live local/remote export smoke test tooling documented in [dev_test_apps/README.md](../../dev_test_apps/README.md).
 
-Make sure you have:
+## Deploying
 
-- Google Cloud SDK installed
-- A GCP project where the Cloud Function will run
-- Access to the source BigQuery project
-- A storage bucket in the destination project
+This app deploys the same way as every other app in `apps/`: with the root [Makefile](../../Makefile) locally, or automatically through the Cloud Build trigger described in the [repository README](../../README.md#cloud-build-trigger). There is no separate deploy script for this app.
 
-Login and set your project:
+Manual deploy from `cloud_run_builder`:
 
 ```bash
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
+make deploy APP=bq_to_gcs_helpers REGION=us-central1 \
+  IMAGE_TAG=dev RUNTIME_SERVICE_ACCOUNT=bq-export@YOUR_PROJECT.iam.gserviceaccount.com \
+  PROJECT_ID=YOUR_PROJECT_ID
 ```
 
-## 2) Set your deployment values
+For Cloud Build-driven deploys, fill in `deploy/dev.env`, `deploy/stage.env`, and `deploy/prod.env` as needed (only `deploy/prod.env` exists today). See [App layout](../../README.md#app-layout) in the root README for the `.env` file format and the `__SET_*__` placeholder convention.
 
-Open `deploy.ps1` and edit the variables at the top:
+## Call the function
 
-```powershell
-$ProjectId = 'your-project-id'
-$Region = 'us-central1'
-$SourceProject = 'source-bigquery-project-id'
-$DatasetId = 'your_dataset'
-$TableId = 'your_table'
-$DestBucket = 'your-project-id-export-bucket'
-$DestObject = 'exports/your_table.csv'
-$Location = 'US'
-$Format = 'CSV'
-$AllowUnauthenticated = 'false'
-```
-
-If you want the function to be publicly callable, set:
-
-```powershell
-$AllowUnauthenticated = 'true'
-```
-
-## 3) Deploy the function
-
-From the project folder in PowerShell:
-
-```powershell
-.\deploy.ps1
-```
-
-This script will:
-
-- enable the required GCP APIs
-- create a service account if needed
-- grant BigQuery and Storage permissions
-- create the bucket if missing
-- deploy the Cloud Function
-
-## 4) Call the function
-
-After deployment, you can call it with a POST request.
-
-Example using an unauthenticated URL:
+After deployment, call it with a POST request. The service is private by default, so the caller needs Cloud Run Invoker access and a bearer token (see `make -C dev_test_apps smoke-test-export-remote` for a scripted example).
 
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
   -d '{
     "source_project": "source-bigquery-project-id",
     "dataset_id": "your_dataset",
@@ -102,31 +70,28 @@ curl -X POST \
     "location": "US",
     "format": "CSV"
   }' \
-  "https://us-central1-YOUR_PROJECT_ID.cloudfunctions.net/export_table_to_gcs"
+  "https://SERVICE_URL"
 ```
 
 Example using query parameters instead:
 
 ```bash
 curl -X GET \
-  "https://us-central1-YOUR_PROJECT_ID.cloudfunctions.net/export_table_to_gcs?source_project=source-bigquery-project-id&dataset_id=your_dataset&table_id=your_table&destination_bucket=your-project-id-export-bucket&destination_object=exports/your_table.csv&location=US&format=CSV"
+  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  "https://SERVICE_URL?source_project=source-bigquery-project-id&dataset_id=your_dataset&table_id=your_table&destination_bucket=your-project-id-export-bucket&destination_object=exports/your_table.csv&location=US&format=CSV"
 ```
 
-## 5) IAM / cross-project permissions
+## IAM / cross-project permissions
 
-The service account used by the Cloud Function must have permissions in both projects:
+The Cloud Run runtime service account must have permissions in both projects:
 
-- Source BigQuery project:
-  - `roles/bigquery.dataViewer`
-  - `roles/bigquery.jobUser`
-- Destination bucket project:
-  - `roles/storage.objectAdmin`
+- Source BigQuery project: `roles/bigquery.dataViewer`, `roles/bigquery.jobUser`
+- Destination bucket project: `roles/storage.objectAdmin`
 
-This is handled by `deploy.ps1`, but if you change the service account manually, make sure those roles are still granted.
+Grant these to the `RUNTIME_SERVICE_ACCOUNT` configured in `deploy/<environment>.env` (or the Cloud Build trigger substitution). See [IAM and secrets](../../README.md#iam-and-secrets) in the root README for the Cloud Build service account's own permissions.
 
-## 6) Notes
+## Notes
 
-- The function uses the default Google Cloud identity for the runtime.
-- Location must match the BigQuery table location.
-- CSV is the default export format, and JSON export is also supported.
-- If you want this as a Cloud Run service instead of a Cloud Function, I can convert the same code to a Cloud Run service in one pass.
+- The function uses the runtime service account's identity for BigQuery and Storage calls; no service-account key file is needed.
+- `location` must match the BigQuery table location.
+- CSV is the default export format; Parquet and other BigQuery extract formats are also supported.

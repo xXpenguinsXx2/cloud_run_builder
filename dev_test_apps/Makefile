@@ -14,9 +14,7 @@ DEV_TEST_APP_DIRS := $(foreach dir,$(wildcard */),$(if $(wildcard $(dir)Dockerfi
 DEV_TEST_APP_NAMES := $(DEV_TEST_APP_DIRS)
 BUILD_TARGETS := $(addprefix build-app-,$(DEV_TEST_APP_NAMES))
 
-ifeq ($(DEV_TEST_APP),postgres)
-DEV_TEST_RUN_ARGS ?= -p 5432:5432 -e POSTGRES_USER=testuser -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=testdb
-else ifeq ($(DEV_TEST_APP),smoke_tests)
+ifeq ($(DEV_TEST_APP),smoke_tests)
 DEV_TEST_RUN_ARGS ?= --add-host host.docker.internal:host-gateway -e FUNCTION_URL=http://host.docker.internal:8080
 endif
 
