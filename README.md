@@ -52,6 +52,7 @@ The tester containers have their own Makefile in `dev_test_apps/`; see [dev_test
 ```bash
 make -C dev_test_apps list
 make -C dev_test_apps build-all
+make -C dev_test_apps run DEV_TEST_APP=postgres
 make -C dev_test_apps run DEV_TEST_APP=smoke_tests
 make -C dev_test_apps smoke-test-export-local
 make -C dev_test_apps smoke-test-export-remote
