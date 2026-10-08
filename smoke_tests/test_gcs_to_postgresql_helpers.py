@@ -28,10 +28,10 @@ class GcsToPostgresqlFunctionTests(unittest.TestCase):
     def test_unsupported_format_returns_bad_request(self):
         response, status = self.call_handler(
             {
-                "source_project": "source-project",
-                "dataset_id": "dataset",
-                "table_id": "table",
-                "destination_bucket": "bucket",
+                "sink_project": "source-project",
+                "sink_dataset_id": "dataset",
+                "sink_table_id": "table",
+                "target_import_bucket": "bucket",
                 "destination_object": "exports/table.json",
                 "format": "JSON",
             }
@@ -76,10 +76,10 @@ class GcsToPostgresqlFunctionTests(unittest.TestCase):
 
         response, status = self.call_handler(
             {
-                "source_project": "source-project",
-                "dataset_id": "dataset",
-                "table_id": "example",
-                "destination_bucket": "test-bucket",
+                "sink_project": "source-project",
+                "sink_dataset_id": "dataset",
+                "sink_table_id": "example",
+                "target_import_bucket": "test-bucket",
                 "destination_object": "example/export-*.csv",
                 "format": "CSV",
             }
@@ -99,10 +99,10 @@ class GcsToPostgresqlFunctionTests(unittest.TestCase):
         payload, error = get_request_payload(
             Mock(
                 get_json=lambda silent: {
-                    "source_project": "source",
-                    "dataset_id": "dataset",
-                    "table_id": "table",
-                    "destination_bucket": "bucket",
+                    "sink_project": "source",
+                    "sink_dataset_id": "dataset",
+                    "sink_table_id": "table",
+                    "target_import_bucket": "bucket",
                     "destination_object": "exports/*/part-*.csv",
                     "format": "CSV",
                 }

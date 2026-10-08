@@ -1,8 +1,8 @@
 # GCS to PostgreSQL importer
 
-This private Cloud Run HTTP function imports CSV or Parquet objects from Cloud Storage into PostgreSQL. The request uses the same fields as the BigQuery-to-GCS export request: `source_project`, `dataset_id`, `table_id`, `destination_bucket`, `destination_object`, and `format`.
+This private Cloud Run HTTP function imports CSV or Parquet objects from Cloud Storage into PostgreSQL. The request fields are: `sink_project`, `sink_dataset_id`, `sink_table_id`, `target_import_bucket`, `destination_object`, and `format`.
 
-The function reads the BigQuery table schema to create the PostgreSQL table. It selects GCS objects matching the exact object name or the single `*` wildcard in `destination_object`, sorts shards by object name, imports them into a staging table, then atomically replaces the destination table after all rows load successfully. CSV imports replace `public.<table_id>`; Parquet imports replace `public.parq_<table_id>`. Nested and repeated BigQuery fields are not supported.
+The function reads the BigQuery table schema to create the PostgreSQL table. It selects GCS objects matching the exact object name or the single `*` wildcard in `destination_object`, sorts shards by object name, imports them into a staging table, then atomically replaces the destination table after all rows load successfully. CSV imports replace `public.<sink_table_id>`; Parquet imports replace `public.parq_<sink_table_id>`. Nested and repeated BigQuery fields are not supported.
 
 ## Local import test
 

@@ -1,8 +1,8 @@
 {
-  "source_project": "jag-pgsql-gke",
-  "dataset_id": "test_01",
-  "table_id": "example",
-  "destination_bucket": "jag_bq_export_bucket",
+  "sink_project": "jag-pgsql-gke",
+  "sink_dataset_id": "test_01",
+  "sink_table_id": "example",
+  "target_import_bucket": "jag_bq_export_bucket",
   "destination_object": "example/cloud-run-export-*.csv",
   "location": "US-CENTRAL1",
   "format": "CSV"

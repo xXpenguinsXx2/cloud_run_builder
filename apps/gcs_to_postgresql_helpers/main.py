@@ -38,10 +38,10 @@ POSTGRES_TYPES = {
     "JSON": "JSONB",
 }
 REQUIRED_FIELDS = (
-    "source_project",
-    "dataset_id",
-    "table_id",
-    "destination_bucket",
+    "sink_project",
+    "sink_dataset_id",
+    "sink_table_id",
+    "target_import_bucket",
     "destination_object",
     "format",
 )
@@ -283,9 +283,9 @@ def import_gcs_to_postgresql(request: Request):
         return jsonify({"error": validation_error}), 400
 
     table_name = (
-        f"parq_{payload['table_id']}"
+        f"parq_{payload['sink_table_id']}"
         if payload["format"] == "PARQUET"
-        else payload["table_id"]
+        else payload["sink_table_id"]
     )
     schema_name = os.environ.get("DB_SCHEMA", "public").strip()
     if not schema_name:
@@ -298,33 +298,33 @@ def import_gcs_to_postgresql(request: Request):
     connection = None
     try:
         source_table_id = (
-            f"{payload['source_project']}."
-            f"{payload['dataset_id']}."
-            f"{payload['table_id']}"
+            f"{payload['sink_project']}."
+            f"{payload['sink_dataset_id']}."
+            f"{payload['sink_table_id']}"
         )
         logger.info(
             "Loading schema for %s before importing %s objects from gs://%s/%s",
             source_table_id,
             payload["format"],
-            payload["destination_bucket"],
+            payload["target_import_bucket"],
             payload["destination_object"],
         )
         source_table = bigquery.Client(
-            project=payload["source_project"]
+            project=payload["sink_project"]
         ).get_table(source_table_id)
         columns = get_table_columns(source_table.schema)
         column_names = [field.name for field in source_table.schema]
 
-        storage_client = storage.Client(project=payload["source_project"])
+        storage_client = storage.Client(project=payload["sink_project"])
         blobs = get_matching_blobs(
             storage_client,
-            payload["destination_bucket"],
+            payload["target_import_bucket"],
             payload["destination_object"],
         )
         if not blobs:
             raise ValueError(
                 "no GCS objects match "
-                f"gs://{payload['destination_bucket']}/"
+                f"gs://{payload['target_import_bucket']}/"
                 f"{payload['destination_object']}"
             )
 
@@ -350,12 +350,12 @@ def import_gcs_to_postgresql(request: Request):
                 {
                     "status": "success",
                     "source": (
-                        f"gs://{payload['destination_bucket']}/"
+                        f"gs://{payload['target_import_bucket']}/"
                         f"{payload['destination_object']}"
                     ),
                     "imported": (
-                        f"{payload['source_project']}:{payload['dataset_id']}."
-                        f"{payload['table_id']}"
+                        f"{payload['sink_project']}:{payload['sink_dataset_id']}."
+                        f"{payload['sink_table_id']}"
                     ),
                     "table": f"{schema_name}.{table_name}",
                     "format": payload["format"],

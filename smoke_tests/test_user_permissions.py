@@ -14,6 +14,10 @@ pg_cloud_sql_connection_name, pg_db_name and pg_db_iam_user are set) connects
 with IAM auth and runs SELECT session_user. With direct impersonation the
 connection uses the impersonated service account; pg_db_iam_user must be that
 SA's database user (SA email without ".gserviceaccount.com").
+If "pg_direct_host" is set (optionally "pg_direct_port", default 5432), the
+Cloud SQL connector is bypassed (it needs TCP 3307) and the test connects
+straight to that host over SSL, sending an IAM access token as the password
+(manual IAM database authentication).
 
 Each check records PASS/FAIL/SKIP and testing continues after a failure. A
 report is printed at the end and the test fails if any check failed.
@@ -437,28 +441,58 @@ class UserPermissionsTests(unittest.TestCase):
         s = "postgresql connection"
         if not self._use_identity("PostgreSQL/GCS", s):
             return
-        if not self._need(
-            s, "pg_cloud_sql_connection_name", "pg_db_name", "pg_db_iam_user"
-        ):
+        direct_host = self.cfg.get("pg_direct_host")
+        use_direct = _is_set(direct_host)
+        required = ["pg_db_name", "pg_db_iam_user"]
+        if not use_direct:
+            required.append("pg_cloud_sql_connection_name")
+        if not self._need(s, *required):
             return
-        try:
-            from google.cloud.sql.connector import Connector, IPTypes
-        except ImportError as exc:
-            self.report.record(s, "import cloud-sql-python-connector", "FAIL", str(exc))
-            return
-        ip_type = str(self.cfg.get("pg_cloud_sql_ip_type", "PUBLIC")).upper()
         connector = None
         conn = None
         try:
-            connector = Connector(credentials=self.sql_credentials)
-            conn = connector.connect(
-                self.cfg["pg_cloud_sql_connection_name"],
-                "pg8000",
-                user=self.cfg["pg_db_iam_user"],
-                db=self.cfg["pg_db_name"],
-                enable_iam_auth=True,
-                ip_type=IPTypes.PRIVATE if ip_type == "PRIVATE" else IPTypes.PUBLIC,
-            )
+            if use_direct:
+                import ssl
+
+                import pg8000.dbapi
+
+                token_creds = self.sql_credentials
+                if token_creds is None:
+                    token_creds, _ = google.auth.default(
+                        scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE]
+                    )
+                token_creds.refresh(Request())
+                # Equivalent to sslmode=require: encrypted, instance cert not verified
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                conn = pg8000.dbapi.connect(
+                    user=self.cfg["pg_db_iam_user"],
+                    password=token_creds.token,
+                    host=direct_host,
+                    port=int(self.cfg.get("pg_direct_port", 5432)),
+                    database=self.cfg["pg_db_name"],
+                    ssl_context=ssl_context,
+                    timeout=30,
+                )
+            else:
+                try:
+                    from google.cloud.sql.connector import Connector, IPTypes
+                except ImportError as exc:
+                    self.report.record(
+                        s, "import cloud-sql-python-connector", "FAIL", str(exc)
+                    )
+                    return
+                ip_type = str(self.cfg.get("pg_cloud_sql_ip_type", "PUBLIC")).upper()
+                connector = Connector(credentials=self.sql_credentials)
+                conn = connector.connect(
+                    self.cfg["pg_cloud_sql_connection_name"],
+                    "pg8000",
+                    user=self.cfg["pg_db_iam_user"],
+                    db=self.cfg["pg_db_name"],
+                    enable_iam_auth=True,
+                    ip_type=IPTypes.PRIVATE if ip_type == "PRIVATE" else IPTypes.PUBLIC,
+                )
             cur = conn.cursor()
             cur.execute("SELECT session_user")
             user = cur.fetchone()[0]
