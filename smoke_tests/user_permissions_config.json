@@ -1,0 +1,18 @@
+{
+  "source_project": "your-source-project",
+  "dataset_id": "your_dataset",
+  "table_id": "your_table",
+  "location": "US",
+  "destination_bucket": "your-export-bucket",
+  "destination_object": "permission-smoke-test/export.csv",
+  "cloud_run_project": "your-cloud-run-project",
+  "cloud_run_region": "us-central1",
+  "cloud_run_service": "bq-to-gcs-helpers",
+  "cloud_sql_connection_name": "your-project:us-central1:your-instance",
+  "cloud_sql_ip_type": "PUBLIC",
+  "db_name": "your_database",
+  "db_iam_user": "your-sa@your-project.iam",
+  "db_schema": "public",
+  "impersonate_service_account": "your-sa@your-project.iam.gserviceaccount.com",
+  "impersonate_directly": false
+}
