@@ -1,16 +1,19 @@
 """User permission smoke tests (live GCP calls, read-only).
 
 Config: user_permissions_config.json (or PERMISSIONS_TEST_CONFIG=<path>).
+Set "bigquery_project" to the project containing the source table and where
+BigQuery jobs run. Set "destination_bucket_project" to label the project that
+owns destination_bucket; Storage permissions are checked on the bucket itself.
 Set "impersonate_directly": true (or PERMISSIONS_IMPERSONATE=true|false) to run
 every check as the service account in "impersonate_service_account" instead of
 the current user. The "can I impersonate this SA" check always runs when the
 key is set.
 
 gcs_to_postgresql: checks BigQuery/GCS/Cloud SQL IAM permissions, then (if
-cloud_sql_connection_name, db_name and db_iam_user are set) connects with IAM
-auth and runs SELECT session_user. With direct impersonation the connection
-uses the impersonated service account; db_iam_user must be that SA's database
-user (SA email without ".gserviceaccount.com").
+pg_cloud_sql_connection_name, pg_db_name and pg_db_iam_user are set) connects
+with IAM auth and runs SELECT session_user. With direct impersonation the
+connection uses the impersonated service account; pg_db_iam_user must be that
+SA's database user (SA email without ".gserviceaccount.com").
 
 Each check records PASS/FAIL/SKIP and testing continues after a failure. A
 report is printed at the end and the test fails if any check failed.
@@ -64,7 +67,9 @@ def _env_bool(name, default):
 
 
 class Report:
-    def __init__(self):
+    def __init__(self, account, projects):
+        self.account = account
+        self.projects = projects
         self.rows = []
 
     def record(self, section, check, status, note=""):
@@ -75,7 +80,14 @@ class Report:
         return [r for r in self.rows if r[2] == "FAIL"]
 
     def render(self):
-        lines = ["", "=== USER PERMISSION REPORT ==="]
+        lines = [
+            "",
+            "=== USER PERMISSION REPORT ===",
+            f"Account: {self.account}",
+            "Projects: " + "; ".join(
+                f"{label}={project}" for label, project in self.projects.items()
+            ),
+        ]
         for section, check, status, note in self.rows:
             lines.append(f"[{status}] {section}: {check}" + (f" -- {note}" if note else ""))
         lines.append(
@@ -91,7 +103,14 @@ class UserPermissionsTests(unittest.TestCase):
         if not CONFIG_PATH.exists():
             raise unittest.SkipTest(f"config not found: {CONFIG_PATH}")
         cls.cfg = json.loads(CONFIG_PATH.read_text())
-        cls.report = Report()
+        projects = {
+            label: str(cls.cfg.get(key, "unspecified")).strip() or "unspecified"
+            for label, key in (
+                ("BigQuery", "bigquery_project"),
+                ("bucket", "destination_bucket_project"),
+            )
+        }
+        cls.report = Report("current ADC user (email not resolved)", projects)
         cls.sa = cls.cfg.get("impersonate_service_account")
         cls.impersonate = _env_bool(
             "PERMISSIONS_IMPERSONATE", bool(cls.cfg.get("impersonate_directly"))
@@ -122,6 +141,7 @@ class UserPermissionsTests(unittest.TestCase):
                     target_scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE],
                 )
                 cls.identity = f"service account {cls.sa} (direct impersonation)"
+                cls.report.account = cls.sa
             except Exception as exc:
                 cls.report.record("impersonation", "direct impersonation", "FAIL", str(exc))
                 cls.impersonate = False
@@ -164,31 +184,42 @@ class UserPermissionsTests(unittest.TestCase):
                 params={"access_token": self.session.credentials.token or ""},
                 timeout=30,
             )
-            who = resp.json().get("email", "unknown") if resp.status_code == 200 else "unknown"
+            who = (resp.json().get("email") or "unknown") if resp.status_code == 200 else "unknown"
+            if who != "unknown" and not self.impersonate:
+                self.report.account = who
             self.report.record("identity", f"running as {self.identity}", "PASS", who)
         except Exception as exc:
             self.report.record("identity", "resolve identity", "FAIL", str(exc))
 
     def test_02_bq_to_gcs_required(self):
         s = "bq_to_gcs required"
-        if self._need(s, "source_project"):
-            p = self.cfg["source_project"]
+        if self._need(s, "bigquery_project"):
+            project = self.cfg["bigquery_project"]
             self._test_iam(
-                s + " (project)",
-                f"https://cloudresourcemanager.googleapis.com/v1/projects/{p}:testIamPermissions",
+                s + f" (BigQuery project: {project})",
+                f"https://cloudresourcemanager.googleapis.com/v1/projects/{project}:testIamPermissions",
                 BQ_PROJECT_PERMS,
             )
+        if self._need(s, "bigquery_project"):
+            p = self.cfg["bigquery_project"]
             if self._need(s, "dataset_id", "table_id"):
                 d, t = self.cfg["dataset_id"], self.cfg["table_id"]
                 self._test_iam(
-                    s + " (source table)",
+                    s + f" (BigQuery source table: {p}.{d}.{t})",
                     f"https://bigquery.googleapis.com/bigquery/v2/projects/{p}/datasets/{d}"
                     f"/tables/{t}:testIamPermissions",
                     BQ_TABLE_PERMS,
                 )
         if self._need(s, "destination_bucket"):
             b = quote(self.cfg["destination_bucket"], safe="")
-            self._gcs_test(s + " (destination bucket)", b, GCS_BUCKET_PERMS)
+            bucket_project = self.cfg.get("destination_bucket_project")
+            bucket_label = (
+                f" (destination bucket: gs://{self.cfg['destination_bucket']}"
+                f" in project {bucket_project})"
+                if _is_set(bucket_project)
+                else f" (destination bucket: gs://{self.cfg['destination_bucket']})"
+            )
+            self._gcs_test(s + bucket_label, b, GCS_BUCKET_PERMS)
 
     def _gcs_test(self, section, bucket, perms):
         try:
@@ -213,17 +244,17 @@ class UserPermissionsTests(unittest.TestCase):
     def test_03_bq_to_gcs_dry_run_access(self):
         """Practical end-to-end read check: dry-run query against the source table."""
         s = "bq_to_gcs required"
-        if not self._need(s, "source_project", "dataset_id", "table_id"):
+        if not self._need(s, "bigquery_project", "dataset_id", "table_id"):
             return
-        p, d, t = (self.cfg[k] for k in ("source_project", "dataset_id", "table_id"))
+        project, d, t = (self.cfg[k] for k in ("bigquery_project", "dataset_id", "table_id"))
         try:
             resp = self.session.post(
-                f"https://bigquery.googleapis.com/bigquery/v2/projects/{p}/jobs",
+                f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/jobs",
                 json={
                     "configuration": {
                         "dryRun": True,
                         "query": {
-                            "query": f"SELECT * FROM `{p}.{d}.{t}`",
+                            "query": f"SELECT * FROM `{project}.{d}.{t}`",
                             "useLegacySql": False,
                         },
                     }
@@ -232,30 +263,46 @@ class UserPermissionsTests(unittest.TestCase):
             )
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-            self.report.record(s, "dry-run query on source table", "PASS")
+            self.report.record(
+                s,
+                f"dry-run query: BigQuery project {project}, source table {project}.{d}.{t}",
+                "PASS",
+            )
         except Exception as exc:
-            self.report.record(s, "dry-run query on source table", "FAIL", str(exc))
+            self.report.record(
+                s,
+                f"dry-run query: BigQuery project {project}, source table {project}.{d}.{t}",
+                "FAIL",
+                str(exc),
+            )
 
     def test_04_common_tasks(self):
         s = "common tasks"
-        if self._need(s, "source_project"):
-            p = self.cfg["source_project"]
+        if self._need(s, "bigquery_project"):
+            p = self.cfg["bigquery_project"]
             self._test_iam(
-                s + " (project)",
+                s + f" (BigQuery project: {p})",
                 f"https://cloudresourcemanager.googleapis.com/v1/projects/{p}:testIamPermissions",
                 BQ_PROJECT_COMMON_PERMS + PROJECT_COMMON_PERMS,
             )
             if self._need(s, "dataset_id"):
                 d = self.cfg["dataset_id"]
                 self._test_iam(
-                    s + " (dataset)",
+                    s + f" (BigQuery dataset: {p}.{d})",
                     f"https://bigquery.googleapis.com/bigquery/v2/projects/{p}/datasets/{d}"
                     f":testIamPermissions",
                     BQ_DATASET_COMMON_PERMS,
                 )
         if self._need(s, "destination_bucket"):
+            bucket_project = self.cfg.get("destination_bucket_project")
+            bucket_label = (
+                f" (bucket objects: gs://{self.cfg['destination_bucket']}"
+                f" in project {bucket_project})"
+                if _is_set(bucket_project)
+                else f" (bucket objects: gs://{self.cfg['destination_bucket']})"
+            )
             self._gcs_test(
-                s + " (bucket objects)",
+                s + bucket_label,
                 quote(self.cfg["destination_bucket"], safe=""),
                 GCS_COMMON_PERMS,
             )
@@ -270,8 +317,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_041_gcs_to_postgresql_gcp_permissions(self):
         s = "gcs_to_postgresql required"
-        if self._need(s, "source_project", "dataset_id", "table_id"):
-            p, d, t = (self.cfg[k] for k in ("source_project", "dataset_id", "table_id"))
+        if self._need(s, "bigquery_project", "dataset_id", "table_id"):
+            p, d, t = (self.cfg[k] for k in ("bigquery_project", "dataset_id", "table_id"))
             self._test_iam(
                 s + " (source table schema)",
                 f"https://bigquery.googleapis.com/bigquery/v2/projects/{p}/datasets/{d}"
@@ -279,16 +326,26 @@ class UserPermissionsTests(unittest.TestCase):
                 PG_BQ_TABLE_PERMS,
             )
         if self._need(s, "destination_bucket"):
+            bucket_project = self.cfg.get("destination_bucket_project")
+            bucket_label = (
+                f" (exported objects: gs://{self.cfg['destination_bucket']}"
+                f" in project {bucket_project})"
+                if _is_set(bucket_project)
+                else f" (exported objects: gs://{self.cfg['destination_bucket']})"
+            )
             self._gcs_test(
-                s + " (exported objects)",
+                s + bucket_label,
                 quote(self.cfg["destination_bucket"], safe=""),
                 PG_GCS_PERMS,
             )
-        if self._need(s, "cloud_sql_connection_name"):
-            parts = self.cfg["cloud_sql_connection_name"].split(":")
+        if self._need(s, "pg_cloud_sql_connection_name"):
+            parts = self.cfg["pg_cloud_sql_connection_name"].split(":")
             if len(parts) != 3:
                 self.report.record(
-                    s, "cloud_sql_connection_name", "FAIL", "expected project:region:instance"
+                    s,
+                    "pg_cloud_sql_connection_name",
+                    "FAIL",
+                    "expected project:region:instance",
                 )
                 return
             project, _, instance = parts
@@ -322,23 +379,25 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_042_postgresql_connection(self):
         s = "postgresql connection"
-        if not self._need(s, "cloud_sql_connection_name", "db_name", "db_iam_user"):
+        if not self._need(
+            s, "pg_cloud_sql_connection_name", "pg_db_name", "pg_db_iam_user"
+        ):
             return
         try:
             from google.cloud.sql.connector import Connector, IPTypes
         except ImportError as exc:
             self.report.record(s, "import cloud-sql-python-connector", "FAIL", str(exc))
             return
-        ip_type = str(self.cfg.get("cloud_sql_ip_type", "PUBLIC")).upper()
+        ip_type = str(self.cfg.get("pg_cloud_sql_ip_type", "PUBLIC")).upper()
         connector = None
         conn = None
         try:
             connector = Connector(credentials=self.sql_credentials)
             conn = connector.connect(
-                self.cfg["cloud_sql_connection_name"],
+                self.cfg["pg_cloud_sql_connection_name"],
                 "pg8000",
-                user=self.cfg["db_iam_user"],
-                db=self.cfg["db_name"],
+                user=self.cfg["pg_db_iam_user"],
+                db=self.cfg["pg_db_name"],
                 enable_iam_auth=True,
                 ip_type=IPTypes.PRIVATE if ip_type == "PRIVATE" else IPTypes.PUBLIC,
             )
@@ -346,12 +405,12 @@ class UserPermissionsTests(unittest.TestCase):
             cur.execute("SELECT session_user")
             user = cur.fetchone()[0]
             self.report.record(s, "connect and SELECT session_user", "PASS", f"session_user={user}")
-            expected = self.cfg["db_iam_user"]
+            expected = self.cfg["pg_db_iam_user"]
             if user != expected:
                 self.report.record(
-                    s, "session_user matches db_iam_user", "FAIL", f"{user} != {expected}"
+                    s, "session_user matches pg_db_iam_user", "FAIL", f"{user} != {expected}"
                 )
-            schema = self.cfg.get("db_schema", "public")
+            schema = self.cfg.get("pg_db_schema", "public")
             cur.execute(
                 "SELECT has_schema_privilege(session_user, %s, 'CREATE'), "
                 "has_schema_privilege(session_user, %s, 'USAGE')",
@@ -383,7 +442,7 @@ class UserPermissionsTests(unittest.TestCase):
                 connector.close()
 
     def test_05_can_impersonate_service_account(self):
-        s = "impersonation"
+        s = "impersonation (current ADC user)"
         if not self._need(s, "impersonate_service_account"):
             return
         sa = quote(self.sa, safe="@")
