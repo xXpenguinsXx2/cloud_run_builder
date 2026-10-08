@@ -15,5 +15,6 @@
   "pg_db_iam_user": "your-sa@your-project.iam",
   "pg_db_schema": "public",
   "impersonate_service_account": "your-sa@your-project.iam.gserviceaccount.com",
+  "pg_impersonate_service_account": "your-pg-sa@your-project.iam.gserviceaccount.com",
   "impersonate_directly": false
 }

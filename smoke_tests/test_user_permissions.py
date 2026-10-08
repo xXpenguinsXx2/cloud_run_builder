@@ -5,9 +5,9 @@ Set "bigquery_project" to the project containing the source table and where
 BigQuery jobs run. Set "destination_bucket_project" to label the project that
 owns destination_bucket; Storage permissions are checked on the bucket itself.
 Set "impersonate_directly": true (or PERMISSIONS_IMPERSONATE=true|false) to run
-every check as the service account in "impersonate_service_account" instead of
-the current user. The "can I impersonate this SA" check always runs when the
-key is set.
+BigQuery/export checks as "impersonate_service_account" and PostgreSQL/import
+checks (including their GCS checks) as "pg_impersonate_service_account". The
+impersonation checks always run for configured service accounts.
 
 gcs_to_postgresql: checks BigQuery/GCS/Cloud SQL IAM permissions, then (if
 pg_cloud_sql_connection_name, pg_db_name and pg_db_iam_user are set) connects
@@ -67,13 +67,14 @@ def _env_bool(name, default):
 
 
 class Report:
-    def __init__(self, account, projects):
-        self.account = account
+    def __init__(self, accounts, projects):
+        self.accounts = accounts
+        self.current_account = "current ADC user (email not resolved)"
         self.projects = projects
         self.rows = []
 
-    def record(self, section, check, status, note=""):
-        self.rows.append((section, check, status, note))
+    def record(self, section, check, status, note="", account=None):
+        self.rows.append((section, check, status, note, account or self.current_account))
 
     @property
     def failures(self):
@@ -83,13 +84,17 @@ class Report:
         lines = [
             "",
             "=== USER PERMISSION REPORT ===",
-            f"Account: {self.account}",
+            "Accounts: " + "; ".join(
+                f"{label}={account}" for label, account in self.accounts.items()
+            ),
             "Projects: " + "; ".join(
                 f"{label}={project}" for label, project in self.projects.items()
             ),
         ]
-        for section, check, status, note in self.rows:
-            lines.append(f"[{status}] {section}: {check}" + (f" -- {note}" if note else ""))
+        for section, check, status, note, account in self.rows:
+            lines.append(
+                f"[{status}] [{account}] {section}: {check}" + (f" -- {note}" if note else "")
+            )
         lines.append(
             f"Totals: {sum(r[2] == 'PASS' for r in self.rows)} pass, "
             f"{len(self.failures)} fail, {sum(r[2] == 'SKIP' for r in self.rows)} skip"
@@ -103,6 +108,21 @@ class UserPermissionsTests(unittest.TestCase):
         if not CONFIG_PATH.exists():
             raise unittest.SkipTest(f"config not found: {CONFIG_PATH}")
         cls.cfg = json.loads(CONFIG_PATH.read_text())
+        cls.impersonate = _env_bool(
+            "PERMISSIONS_IMPERSONATE", bool(cls.cfg.get("impersonate_directly"))
+        )
+        accounts = {
+            "BigQuery/GCS": cls.cfg.get("impersonate_service_account")
+            if cls.impersonate
+            else "current ADC user",
+            "PostgreSQL/GCS": cls.cfg.get("pg_impersonate_service_account")
+            if cls.impersonate
+            else "current ADC user",
+        }
+        accounts = {
+            label: (value if _is_set(value) else "not configured")
+            for label, value in accounts.items()
+        }
         projects = {
             label: str(cls.cfg.get(key, "unspecified")).strip() or "unspecified"
             for label, key in (
@@ -110,11 +130,7 @@ class UserPermissionsTests(unittest.TestCase):
                 ("bucket", "destination_bucket_project"),
             )
         }
-        cls.report = Report("current ADC user (email not resolved)", projects)
-        cls.sa = cls.cfg.get("impersonate_service_account")
-        cls.impersonate = _env_bool(
-            "PERMISSIONS_IMPERSONATE", bool(cls.cfg.get("impersonate_directly"))
-        )
+        cls.report = Report(accounts, projects)
         try:
             cls.user_creds, _ = google.auth.default(scopes=SCOPES)
             cls.user_session = AuthorizedSession(cls.user_creds)
@@ -122,29 +138,56 @@ class UserPermissionsTests(unittest.TestCase):
             raise unittest.SkipTest(f"no application default credentials: {exc}")
 
         cls.session = cls.user_session
-        cls.sql_credentials = None  # None -> Cloud SQL connector uses ADC
-        cls.identity = "current user"
-        if cls.impersonate:
-            if not _is_set(cls.sa):
-                raise unittest.SkipTest("impersonate_directly set but no impersonate_service_account")
-            try:
-                creds = impersonated_credentials.Credentials(
-                    source_credentials=cls.user_creds,
-                    target_principal=cls.sa,
+        cls.sql_credentials = None
+        cls.identity = "current ADC user"
+        cls.current_adc_account = "current ADC user (email not resolved)"
+        cls._identity_cache = {}
+
+    def _use_identity(self, role, section):
+        if not self.impersonate:
+            self.session = self.user_session
+            self.sql_credentials = None
+            self.identity = "current ADC user"
+            self.report.current_account = self.current_adc_account
+            return True
+
+        config_key = (
+            "impersonate_service_account"
+            if role == "BigQuery/GCS"
+            else "pg_impersonate_service_account"
+        )
+        account = self.cfg.get(config_key)
+        if not _is_set(account):
+            self.report.current_account = "current ADC user"
+            self.report.record(section, "impersonation config", "SKIP", f"unset: {config_key}")
+            return False
+
+        try:
+            if account not in self._identity_cache:
+                credentials = impersonated_credentials.Credentials(
+                    source_credentials=self.user_creds,
+                    target_principal=account,
                     target_scopes=SCOPES,
                 )
-                creds.refresh(Request())
-                cls.session = AuthorizedSession(creds)
-                cls.sql_credentials = impersonated_credentials.Credentials(
-                    source_credentials=cls.user_creds,
-                    target_principal=cls.sa,
-                    target_scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE],
-                )
-                cls.identity = f"service account {cls.sa} (direct impersonation)"
-                cls.report.account = cls.sa
-            except Exception as exc:
-                cls.report.record("impersonation", "direct impersonation", "FAIL", str(exc))
-                cls.impersonate = False
+                credentials.refresh(Request())
+                self._identity_cache[account] = {
+                    "session": AuthorizedSession(credentials),
+                    "sql_credentials": impersonated_credentials.Credentials(
+                        source_credentials=self.user_creds,
+                        target_principal=account,
+                        target_scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE],
+                    ),
+                }
+            identity = self._identity_cache[account]
+            self.session = identity["session"]
+            self.sql_credentials = identity["sql_credentials"] if role == "PostgreSQL/GCS" else None
+            self.identity = f"service account {account}"
+            self.report.current_account = account
+            return True
+        except Exception as exc:
+            self.report.current_account = account
+            self.report.record(section, "direct impersonation", "FAIL", str(exc))
+            return False
 
     @classmethod
     def tearDownClass(cls):
@@ -178,6 +221,9 @@ class UserPermissionsTests(unittest.TestCase):
 
     # sections
     def test_01_identity(self):
+        self.session = self.user_session
+        self.identity = "current ADC user"
+        self.report.current_account = self.identity
         try:
             resp = self.session.get(
                 "https://oauth2.googleapis.com/tokeninfo",
@@ -185,14 +231,18 @@ class UserPermissionsTests(unittest.TestCase):
                 timeout=30,
             )
             who = (resp.json().get("email") or "unknown") if resp.status_code == 200 else "unknown"
-            if who != "unknown" and not self.impersonate:
-                self.report.account = who
+            if who != "unknown":
+                self.report.accounts["ADC user"] = who
+                self.current_adc_account = who
+            self.report.current_account = self.current_adc_account
             self.report.record("identity", f"running as {self.identity}", "PASS", who)
         except Exception as exc:
             self.report.record("identity", "resolve identity", "FAIL", str(exc))
 
     def test_02_bq_to_gcs_required(self):
         s = "bq_to_gcs required"
+        if not self._use_identity("BigQuery/GCS", s):
+            return
         if self._need(s, "bigquery_project"):
             project = self.cfg["bigquery_project"]
             self._test_iam(
@@ -244,6 +294,8 @@ class UserPermissionsTests(unittest.TestCase):
     def test_03_bq_to_gcs_dry_run_access(self):
         """Practical end-to-end read check: dry-run query against the source table."""
         s = "bq_to_gcs required"
+        if not self._use_identity("BigQuery/GCS", s):
+            return
         if not self._need(s, "bigquery_project", "dataset_id", "table_id"):
             return
         project, d, t = (self.cfg[k] for k in ("bigquery_project", "dataset_id", "table_id"))
@@ -278,6 +330,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_04_common_tasks(self):
         s = "common tasks"
+        if not self._use_identity("BigQuery/GCS", s):
+            return
         if self._need(s, "bigquery_project"):
             p = self.cfg["bigquery_project"]
             self._test_iam(
@@ -317,6 +371,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_041_gcs_to_postgresql_gcp_permissions(self):
         s = "gcs_to_postgresql required"
+        if not self._use_identity("PostgreSQL/GCS", s):
+            return
         if self._need(s, "bigquery_project", "dataset_id", "table_id"):
             p, d, t = (self.cfg[k] for k in ("bigquery_project", "dataset_id", "table_id"))
             self._test_iam(
@@ -379,6 +435,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_042_postgresql_connection(self):
         s = "postgresql connection"
+        if not self._use_identity("PostgreSQL/GCS", s):
+            return
         if not self._need(
             s, "pg_cloud_sql_connection_name", "pg_db_name", "pg_db_iam_user"
         ):
@@ -443,34 +501,45 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_05_can_impersonate_service_account(self):
         s = "impersonation (current ADC user)"
-        if not self._need(s, "impersonate_service_account"):
-            return
-        sa = quote(self.sa, safe="@")
-        # Always evaluated as the real user, even in direct impersonation mode
-        self._test_iam(
-            s + " (permissions on SA)",
-            f"https://iam.googleapis.com/v1/projects/-/serviceAccounts/{sa}:testIamPermissions",
-            IMPERSONATE_PERMS,
-            session=self.user_session,
-        )
-        try:
-            resp = self.user_session.post(
-                f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{sa}:generateAccessToken",
-                json={"scope": SCOPES},
-                timeout=30,
+        self.session = self.user_session
+        self.identity = "current ADC user"
+        self.report.current_account = self.current_adc_account
+        for role, config_key in (
+            ("BigQuery/GCS", "impersonate_service_account"),
+            ("PostgreSQL/GCS", "pg_impersonate_service_account"),
+        ):
+            target = self.cfg.get(config_key)
+            if not _is_set(target):
+                self.report.record(
+                    s, f"{role} service account", "SKIP", f"unset: {config_key}"
+                )
+                continue
+            sa = quote(target, safe="@")
+            section = f"{s} ({role}: {target})"
+            self._test_iam(
+                section + " permissions on SA",
+                f"https://iam.googleapis.com/v1/projects/-/serviceAccounts/{sa}:testIamPermissions",
+                IMPERSONATE_PERMS,
+                session=self.user_session,
             )
-            if resp.status_code != 200:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-            self.report.record(s, "generateAccessToken for SA", "PASS")
-        except Exception as exc:
-            self.report.record(s, "generateAccessToken for SA", "FAIL", str(exc))
+            try:
+                resp = self.user_session.post(
+                    f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{sa}:generateAccessToken",
+                    json={"scope": SCOPES},
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                self.report.record(section, "generateAccessToken", "PASS")
+            except Exception as exc:
+                self.report.record(section, "generateAccessToken", "FAIL", str(exc))
 
     def test_99_no_failures(self):
         failures = self.report.failures
         self.assertFalse(
             failures,
             "permission checks failed:\n"
-            + "\n".join(f"  {s}: {c} -- {n}" for s, c, _, n in failures),
+            + "\n".join(f"  [{account}] {s}: {c} -- {n}" for s, c, _, n, account in failures),
         )
 
 
