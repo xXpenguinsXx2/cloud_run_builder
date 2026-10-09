@@ -12,6 +12,7 @@ services:
       DB_NAME: ${PG_DB_NAME:?set PG_DB_NAME}
       DB_USER: ${PG_DB_IAM_USER:?set PG_DB_IAM_USER}
       DB_IAM_TOKEN_AUTH: "true"
+      DB_SSL: ${PG_DB_SSL:-true}
       DB_SCHEMA: ${PG_DB_SCHEMA:-public}
     volumes:
       - type: bind

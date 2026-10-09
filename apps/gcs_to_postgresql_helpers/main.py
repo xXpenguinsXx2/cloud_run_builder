@@ -168,9 +168,12 @@ def get_database_connection():
         )
         credentials.refresh(AuthRequest())
         password = credentials.token
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        # DB_SSL=false for hosts that terminate TLS elsewhere (e.g. Cloud SQL
+        # Auth Proxy), which refuse the SSL request from the client.
+        if os.environ.get("DB_SSL", "true").strip().lower() not in ("0", "false", "no"):
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
     if not host or not database or not user or not password:
         raise ValueError(
             "DB_HOST, DB_NAME, DB_USER, and DB_PASSWORD are required for "
