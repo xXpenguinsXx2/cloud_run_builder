@@ -28,7 +28,10 @@ endif
 
 POSTGRES_IMPORT_COMPOSE = docker compose -f gcs_to_postgresql.compose.yaml
 
+REMOTE_IMPORT_COMPOSE = docker compose -f gcs_to_postgresql.remote.compose.yaml
+
 .PHONY: help list build build-all run smoke-test-export-local smoke-test-export-remote \
+	remote-import remote-import-up remote-import-down \
 	local-import-postgres-up local-import-postgres-down local-import $(BUILD_TARGETS)
 
 help:
@@ -36,6 +39,8 @@ help:
 	@echo "smoke-test-export-local checks local readiness and the BigQuery dataset/table, then exports CSV and Parquet."
 	@echo "smoke-test-export-remote checks the BigQuery dataset/table, then exports CSV and Parquet via deployed Cloud Run."
 	@echo "local-import-postgres-up starts local PostgreSQL and the GCS importer at localhost:5433 and localhost:8081."
+	@echo "remote-import runs the importer in Docker against the real Cloud SQL host (direct connection, IAM token as password, SSL)."
+	@echo "  Requires PG_DIRECT_HOST, PG_DB_NAME, PG_DB_IAM_USER (optional PG_DIRECT_PORT, PG_DB_SCHEMA); remote-import-down stops it."
 	@echo "local-import triggers CSV and Parquet imports from the configured GCS requests into the local PostgreSQL container."
 
 list:
@@ -65,6 +70,16 @@ local-import: local-import-postgres-up
 	$(PYTHON) smoke_tests/local_import_smoke_test.py --request smoke_tests/import-request-csv.json
 	$(PYTHON) smoke_tests/local_import_smoke_test.py --request smoke_tests/import-request-parquet.json
 	$(POSTGRES_IMPORT_COMPOSE) exec -T postgres psql -U testuser -d testdb -c "SELECT 'example' AS table_name, COUNT(*) AS rows FROM public.example UNION ALL SELECT 'parq_example', COUNT(*) FROM public.parq_example;"
+
+remote-import-up:
+	$(REMOTE_IMPORT_COMPOSE) up -d --build --wait
+
+remote-import-down:
+	$(REMOTE_IMPORT_COMPOSE) down
+
+remote-import: remote-import-up
+	$(PYTHON) smoke_tests/local_import_smoke_test.py --url http://127.0.0.1:8082 --request smoke_tests/import-request-csv.json
+	$(PYTHON) smoke_tests/local_import_smoke_test.py --url http://127.0.0.1:8082 --request smoke_tests/import-request-parquet.json
 
 $(BUILD_TARGETS):
 	docker build --tag "$(IMAGE_PREFIX)-$(patsubst build-app-%,%,$@):$(IMAGE_TAG)" "$(patsubst build-app-%,%,$@)"

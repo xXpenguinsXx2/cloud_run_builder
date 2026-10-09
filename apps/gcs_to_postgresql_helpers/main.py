@@ -152,6 +152,25 @@ def get_database_connection():
     host = os.environ.get("DB_HOST", "").strip()
     user = os.environ.get("DB_USER", "").strip()
     password = os.environ.get("DB_PASSWORD", "")
+    ssl_context = None
+    if os.environ.get("DB_IAM_TOKEN_AUTH", "").strip().lower() in ("1", "true", "yes"):
+        # Manual IAM database authentication: an OAuth access token is the password.
+        import ssl
+
+        import google.auth
+        from google.auth.transport.requests import Request as AuthRequest
+
+        credentials, _ = google.auth.default(
+            scopes=[
+                "https://www.googleapis.com/auth/cloud-platform",
+                "https://www.googleapis.com/auth/sqlservice.login",
+            ]
+        )
+        credentials.refresh(AuthRequest())
+        password = credentials.token
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
     if not host or not database or not user or not password:
         raise ValueError(
             "DB_HOST, DB_NAME, DB_USER, and DB_PASSWORD are required for "
@@ -165,6 +184,7 @@ def get_database_connection():
             user=user,
             password=password,
             timeout=float(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "15")),
+            ssl_context=ssl_context,
         ),
         None,
     )

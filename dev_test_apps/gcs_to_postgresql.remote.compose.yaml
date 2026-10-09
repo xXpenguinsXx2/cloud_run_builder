@@ -1,0 +1,32 @@
+services:
+  importer:
+    build:
+      context: ../apps/gcs_to_postgresql_helpers
+      dockerfile: Dockerfile
+    environment:
+      PORT: "8080"
+      GOOGLE_APPLICATION_CREDENTIALS: /root/.config/gcloud/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-jag-pgsql-gke}
+      DB_HOST: ${PG_DIRECT_HOST:?set PG_DIRECT_HOST}
+      DB_PORT: ${PG_DIRECT_PORT:-5432}
+      DB_NAME: ${PG_DB_NAME:?set PG_DB_NAME}
+      DB_USER: ${PG_DB_IAM_USER:?set PG_DB_IAM_USER}
+      DB_IAM_TOKEN_AUTH: "true"
+      DB_SCHEMA: ${PG_DB_SCHEMA:-public}
+    volumes:
+      - type: bind
+        source: ${APPDATA}/gcloud
+        target: /root/.config/gcloud
+        read_only: true
+    ports:
+      - "127.0.0.1:8082:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 8080), timeout=2).close()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
