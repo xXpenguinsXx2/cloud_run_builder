@@ -1,4 +1,4 @@
-"""User permission smoke tests (live GCP calls, read-only).
+﻿"""User permission smoke tests (live GCP calls, read-only).
 
 Config: user_permissions_config.json (or PERMISSIONS_TEST_CONFIG=<path>).
 Set "bigquery_project" to the project containing the source table and where
@@ -17,7 +17,12 @@ SA's database user (SA email without ".gserviceaccount.com").
 If "pg_direct_host" is set (optionally "pg_direct_port", default 5432), the
 Cloud SQL connector is bypassed (it needs TCP 3307) and the test connects
 straight to that host over SSL, sending an IAM access token as the password
-(manual IAM database authentication).
+(manual IAM database authentication); set "pg_ssl": false if a proxy refuses SSL.
+If "pg_secret_name" is set, the password is read from Secret Manager (project
+"pg_secret_project", optional "pg_secret_version", default latest; or a full
+projects/.../secrets/... name) and used as a regular password login for
+"pg_db_user" (falls back to pg_db_iam_user), with direct or connector access.
+The secret is read as the active identity, which needs secretmanager.versions.access.
 
 Each check records PASS/FAIL/SKIP and testing continues after a failure. A
 report is printed at the end and the test fails if any check failed.
@@ -25,6 +30,7 @@ Unconfigured placeholder values ("your-...") are skipped.
 
 Run: python -m unittest test_user_permissions -v
 """
+import base64
 import json
 import os
 import unittest
@@ -222,6 +228,32 @@ class UserPermissionsTests(unittest.TestCase):
             self.report.record(section, "config", "SKIP", f"unset: {', '.join(missing)}")
             return False
         return True
+
+    def _read_secret(self):
+        """Return the payload of pg_secret_name (latest, or pg_secret_version) as text."""
+        name = str(self.cfg["pg_secret_name"]).strip()
+        version = str(self.cfg.get("pg_secret_version", "latest"))
+        if name.startswith("projects/"):
+            resource = name.split("/versions/")[0]
+        else:
+            project = next(
+                (
+                    self.cfg[k]
+                    for k in ("pg_secret_project", "pg_project", "bigquery_project")
+                    if _is_set(self.cfg.get(k))
+                ),
+                None,
+            )
+            if project is None:
+                raise ValueError("set pg_secret_project (or use a full projects/... name)")
+            resource = f"projects/{project}/secrets/{name}"
+        resp = self.session.get(
+            f"https://secretmanager.googleapis.com/v1/{resource}/versions/{version}:access",
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return base64.b64decode(resp.json()["payload"]["data"]).decode("utf-8").strip()
 
     # sections
     def test_01_identity(self):
@@ -443,32 +475,55 @@ class UserPermissionsTests(unittest.TestCase):
             return
         direct_host = self.cfg.get("pg_direct_host")
         use_direct = _is_set(direct_host)
-        required = ["pg_db_name", "pg_db_iam_user"]
+        use_secret = _is_set(self.cfg.get("pg_secret_name"))
+        user_key = (
+            "pg_db_user"
+            if use_secret and _is_set(self.cfg.get("pg_db_user"))
+            else "pg_db_iam_user"
+        )
+        required = ["pg_db_name", user_key]
         if not use_direct:
             required.append("pg_cloud_sql_connection_name")
         if not self._need(s, *required):
             return
+        db_user = self.cfg[user_key]
         connector = None
         conn = None
         try:
+            secret_value = None
+            if use_secret:
+                try:
+                    secret_value = self._read_secret()
+                    self.report.record(s, "read password from Secret Manager", "PASS")
+                except Exception as exc:
+                    self.report.record(
+                        s, "read password from Secret Manager", "FAIL", str(exc)
+                    )
+                    return
             if use_direct:
                 import ssl
 
                 import pg8000.dbapi
 
-                token_creds = self.sql_credentials
-                if token_creds is None:
-                    token_creds, _ = google.auth.default(
-                        scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE]
-                    )
-                token_creds.refresh(Request())
-                # Equivalent to sslmode=require: encrypted, instance cert not verified
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
+                if use_secret:
+                    credential = secret_value
+                else:
+                    token_creds = self.sql_credentials
+                    if token_creds is None:
+                        token_creds, _ = google.auth.default(
+                            scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE]
+                        )
+                    token_creds.refresh(Request())
+                    credential = token_creds.token
+                ssl_context = None
+                if self.cfg.get("pg_ssl", True):
+                    # Equivalent to sslmode=require: encrypted, instance cert not verified
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
                 conn = pg8000.dbapi.connect(
-                    user=self.cfg["pg_db_iam_user"],
-                    password=token_creds.token,
+                    user=db_user,
+                    password=credential,
                     host=direct_host,
                     port=int(self.cfg.get("pg_direct_port", 5432)),
                     database=self.cfg["pg_db_name"],
@@ -485,19 +540,24 @@ class UserPermissionsTests(unittest.TestCase):
                     return
                 ip_type = str(self.cfg.get("pg_cloud_sql_ip_type", "PUBLIC")).upper()
                 connector = Connector(credentials=self.sql_credentials)
+                connect_kwargs = (
+                    {"password": secret_value}
+                    if use_secret
+                    else {"enable_iam_auth": True}
+                )
                 conn = connector.connect(
                     self.cfg["pg_cloud_sql_connection_name"],
                     "pg8000",
-                    user=self.cfg["pg_db_iam_user"],
+                    user=db_user,
                     db=self.cfg["pg_db_name"],
-                    enable_iam_auth=True,
                     ip_type=IPTypes.PRIVATE if ip_type == "PRIVATE" else IPTypes.PUBLIC,
+                    **connect_kwargs,
                 )
             cur = conn.cursor()
             cur.execute("SELECT session_user")
             user = cur.fetchone()[0]
             self.report.record(s, "connect and SELECT session_user", "PASS", f"session_user={user}")
-            expected = self.cfg["pg_db_iam_user"]
+            expected = db_user
             if user != expected:
                 self.report.record(
                     s, "session_user matches pg_db_iam_user", "FAIL", f"{user} != {expected}"
