@@ -20,7 +20,15 @@ straight to that host over SSL, sending an IAM access token as the password
 (manual IAM database authentication); set "pg_ssl": false if a proxy refuses SSL.
 If "pg_secret_name" is set, the password is read from Secret Manager (project
 "pg_secret_project", optional "pg_secret_version", default latest; or a full
-projects/.../secrets/... name) and used as a regular password login for
+projects/.../secrets/... name). To pass a token you already have (e.g. the output
+of gcloud auth print-access-token / generate-identity-token, as used in DBeaver),
+set env PG_PASSWORD_TOKEN or "pg_password_token"; it is used verbatim as the
+password for pg_db_iam_user and takes precedence over the secret. Tokens expire
+(about 1 hour), so refresh it before each run.
+If the secret is a service account key (JSON, or a
+bare PEM plus "pg_secret_service_account" email), the test signs in as that service
+account and uses its IAM access token as the password, with pg_db_iam_user as the
+database user. Otherwise the secret is used as a plain password for
 "pg_db_user" (falls back to pg_db_iam_user), with direct or connector access.
 The secret is read as the active identity, which needs secretmanager.versions.access.
 
@@ -255,6 +263,37 @@ class UserPermissionsTests(unittest.TestCase):
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         return base64.b64decode(resp.json()["payload"]["data"]).decode("utf-8").strip()
 
+    def _key_credentials(self, secret):
+        """Service account credentials if the secret is a SA key (JSON or bare PEM), else None."""
+        from google.oauth2 import service_account
+
+        scopes = SCOPES + [SQLSERVICE_LOGIN_SCOPE]
+        if secret.lstrip().startswith("{"):
+            return service_account.Credentials.from_service_account_info(
+                json.loads(secret), scopes=scopes
+            )
+        if secret.lstrip().startswith("-----BEGIN"):
+            email = next(
+                (
+                    self.cfg[k]
+                    for k in ("pg_secret_service_account", "pg_impersonate_service_account")
+                    if _is_set(self.cfg.get(k))
+                ),
+                None,
+            )
+            if email is None:
+                raise ValueError("secret is a bare private key; set pg_secret_service_account")
+            return service_account.Credentials.from_service_account_info(
+                {
+                    "type": "service_account",
+                    "client_email": email,
+                    "private_key": secret,
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                },
+                scopes=scopes,
+            )
+        return None
+
     # sections
     def test_01_identity(self):
         self.session = self.user_session
@@ -475,7 +514,11 @@ class UserPermissionsTests(unittest.TestCase):
             return
         direct_host = self.cfg.get("pg_direct_host")
         use_direct = _is_set(direct_host)
-        use_secret = _is_set(self.cfg.get("pg_secret_name"))
+        static_token = (
+            os.environ.get("PG_PASSWORD_TOKEN") or str(self.cfg.get("pg_password_token", ""))
+        ).strip()
+        static_token = static_token if _is_set(static_token) else ""
+        use_secret = _is_set(self.cfg.get("pg_secret_name")) and not static_token
         user_key = (
             "pg_db_user"
             if use_secret and _is_set(self.cfg.get("pg_db_user"))
@@ -490,22 +533,39 @@ class UserPermissionsTests(unittest.TestCase):
         connector = None
         conn = None
         try:
-            secret_value = None
+            secret_value = static_token or None
+            if static_token:
+                self.report.record(s, "using supplied token as password", "PASS")
             if use_secret:
                 try:
                     secret_value = self._read_secret()
-                    self.report.record(s, "read password from Secret Manager", "PASS")
+                    self.report.record(s, "read secret from Secret Manager", "PASS")
                 except Exception as exc:
                     self.report.record(
-                        s, "read password from Secret Manager", "FAIL", str(exc)
+                        s, "read secret from Secret Manager", "FAIL", str(exc)
                     )
                     return
+                try:
+                    key_creds = self._key_credentials(secret_value)
+                except Exception as exc:
+                    self.report.record(s, "load service account key from secret", "FAIL", str(exc))
+                    return
+                if key_creds is not None:
+                    # Secret is a service account key: sign in as that SA, use an IAM token
+                    self.sql_credentials = key_creds
+                    secret_value = None
+                    self.report.record(
+                        s,
+                        "secret is a service account key",
+                        "PASS",
+                        key_creds.service_account_email,
+                    )
             if use_direct:
                 import ssl
 
                 import pg8000.dbapi
 
-                if use_secret:
+                if secret_value is not None:
                     credential = secret_value
                 else:
                     token_creds = self.sql_credentials
@@ -542,7 +602,7 @@ class UserPermissionsTests(unittest.TestCase):
                 connector = Connector(credentials=self.sql_credentials)
                 connect_kwargs = (
                     {"password": secret_value}
-                    if use_secret
+                    if secret_value is not None
                     else {"enable_iam_auth": True}
                 )
                 conn = connector.connect(

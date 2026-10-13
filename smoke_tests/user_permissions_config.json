@@ -17,6 +17,7 @@
   "pg_db_iam_user": "your-sa@your-project.iam",
   "pg_secret_name": "your-pg-password-secret",
   "pg_secret_project": "your-secret-project",
+  "pg_secret_service_account": "your-sa@your-project.iam.gserviceaccount.com",
   "pg_db_user": "your-db-user",
   "pg_ssl": true,
   "pg_db_schema": "public",
