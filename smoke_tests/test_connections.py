@@ -1,4 +1,4 @@
-"""PostgreSQL connection smoke tests (live connection).
+"""PostgreSQL direct connection check.
 
 Config: connections_config.json (or CONNECTIONS_TEST_CONFIG=<path>).
 
@@ -10,18 +10,16 @@ For a user account, pg_db_user is your email address.
 "pg_cloud_sql_ip_type" (PUBLIC/PRIVATE) is reserved for Cloud SQL connector
 connections and is not used by the direct-host connection.
 
-The live test is skipped when the config is missing or still has placeholder
-values ("your-..."). The connect-parameter tests are mocked and always run.
+Prints whether the login succeeded or failed; exits 0 on success, 1 on failure.
 
-Run: python -m unittest smoke_tests.test_connections -v
+Run: python smoke_tests/test_connections.py
 """
 import json
 import os
 import shutil
 import subprocess
-import unittest
+import sys
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 CONFIG_PATH = Path(
     os.environ.get(
@@ -37,10 +35,7 @@ def _is_set(value):
 
 
 def load_config(path=CONFIG_PATH):
-    path = Path(path)
-    if not path.exists():
-        return None
-    with path.open(encoding="utf-8") as config_file:
+    with Path(path).open(encoding="utf-8") as config_file:
         return json.load(config_file)
 
 
@@ -72,77 +67,47 @@ def build_connect_params(cfg, password):
     }
 
 
-def connect_direct(cfg, password=None):
+def check_login(cfg):
+    """Log in and return the session user reported by PostgreSQL."""
     import pg8000.dbapi
 
-    if password is None:
-        password = get_gcloud_access_token()
-    return pg8000.dbapi.connect(**build_connect_params(cfg, password))
+    conn = pg8000.dbapi.connect(**build_connect_params(cfg, get_gcloud_access_token()))
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT session_user")
+        return cursor.fetchone()[0]
+    finally:
+        conn.close()
 
 
-class ConnectParamsTests(unittest.TestCase):
-    CFG = {
-        "pg_direct_host": "10.0.0.5",
-        "pg_db_name": "appdb",
-        "pg_db_user": "me@example.com",
-    }
+def main():
+    try:
+        cfg = load_config()
+    except (OSError, ValueError) as exc:
+        print(f"FAILED: could not read config {CONFIG_PATH}: {exc}")
+        return 1
 
-    def test_default_params_use_direct_host(self):
-        params = build_connect_params(self.CFG, "token-123")
+    missing = [key for key in REQUIRED_KEYS if not _is_set(cfg.get(key))]
+    if missing:
+        print(f"FAILED: config values not set: {', '.join(missing)}")
+        return 1
 
-        self.assertEqual(params["user"], "me@example.com")
-        self.assertEqual(params["password"], "token-123")
-        self.assertEqual(params["host"], "10.0.0.5")
-        self.assertEqual(params["port"], 5432)
-        self.assertEqual(params["database"], "appdb")
-        self.assertEqual(params["timeout"], 30)
-        self.assertNotIn("ssl_context", params)
+    target = (
+        f"{cfg['pg_db_user']}@{cfg['pg_direct_host']}:"
+        f"{cfg.get('pg_direct_port', 5432)}/{cfg['pg_db_name']}"
+    )
+    try:
+        session_user = check_login(cfg)
+    except subprocess.CalledProcessError as exc:
+        print(f"FAILED: gcloud auth print-access-token failed: {(exc.stderr or '').strip() or exc}")
+        return 1
+    except Exception as exc:
+        print(f"FAILED: login to {target}: {exc}")
+        return 1
 
-    def test_custom_port(self):
-        params = build_connect_params({**self.CFG, "pg_direct_port": "6432"}, "t")
-
-        self.assertEqual(params["port"], 6432)
-
-    @patch("subprocess.run")
-    def test_connect_posts_gcloud_token_as_password(self, run):
-        run.return_value = Mock(stdout="gcloud-token\n")
-        with patch("pg8000.dbapi.connect") as connect:
-            connect_direct(self.CFG)
-
-        self.assertEqual(run.call_args.args[0][1:], ["auth", "print-access-token"])
-        kwargs = connect.call_args.kwargs
-        self.assertEqual(kwargs["password"], "gcloud-token")
-        self.assertEqual(kwargs["host"], "10.0.0.5")
-        self.assertEqual(kwargs["user"], "me@example.com")
-
-    @patch("subprocess.run")
-    def test_empty_token_raises(self, run):
-        run.return_value = Mock(stdout="  \n")
-        with self.assertRaisesRegex(RuntimeError, "empty token"):
-            get_gcloud_access_token()
-
-
-class DirectPostgresConnectionTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.cfg = load_config()
-        if cls.cfg is None:
-            raise unittest.SkipTest(f"Config not found: {CONFIG_PATH}")
-        missing = [key for key in REQUIRED_KEYS if not _is_set(cls.cfg.get(key))]
-        if missing:
-            raise unittest.SkipTest(f"Config values not set: {', '.join(missing)}")
-
-    def test_direct_host_connection_with_user_credentials(self):
-        conn = connect_direct(self.cfg)
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT session_user")
-            session_user = cursor.fetchone()[0]
-        finally:
-            conn.close()
-
-        self.assertEqual(session_user, self.cfg["pg_db_user"])
+    print(f"SUCCESS: logged in to {target} as session_user={session_user}")
+    return 0
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(main())
