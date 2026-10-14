@@ -40,11 +40,8 @@ load_app_config() {
   source "$config_file"
 
   SERVICE_NAME="${SERVICE_NAME:-${app_name//_/-}-$deploy_environment}"
-  : "${RUNTIME_SERVICE_ACCOUNT:?Set RUNTIME_SERVICE_ACCOUNT in $config_file}"
-  if [[ "$RUNTIME_SERVICE_ACCOUNT" == "__SET_IN_TRIGGER__" ]]; then
-    echo "Set the Cloud Build _RUNTIME_SERVICE_ACCOUNT substitution to the existing non-default service account email." >&2
-    return 1
-  fi
+  # Optional: when empty, Cloud Run uses its default identity.
+  RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-}"
   image_uri="$DEPLOY_REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/$SERVICE_NAME:$image_tag"
 }
 

@@ -19,9 +19,21 @@
   "pg_secret_project": "your-secret-project",
   "pg_secret_service_account": "your-sa@your-project.iam.gserviceaccount.com",
   "pg_db_user": "your-db-user",
-  "pg_ssl": true,
   "pg_db_schema": "public",
   "impersonate_service_account": "your-sa@your-project.iam.gserviceaccount.com",
   "pg_impersonate_service_account": "your-pg-sa@your-project.iam.gserviceaccount.com",
-  "impersonate_directly": false
+  "is_impersonate_directly": false,
+  "is_use_direct_host": true,
+  "is_use_secret": true,
+  "is_use_static_token": false,
+  "is_use_db_user": true,
+  "is_pg_ssl": true,
+  "is_check_bq_to_gcs": true,
+  "is_check_bq_dry_run": true,
+  "is_check_common_tasks": true,
+  "is_check_cloud_run": true,
+  "is_check_gcs_to_postgresql": true,
+  "is_check_cloud_sql_instance": true,
+  "is_check_postgresql_connection": true,
+  "is_check_impersonation": true
 }

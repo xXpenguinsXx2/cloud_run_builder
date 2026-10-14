@@ -32,6 +32,14 @@ database user. Otherwise the secret is used as a plain password for
 "pg_db_user" (falls back to pg_db_iam_user), with direct or connector access.
 The secret is read as the active identity, which needs secretmanager.versions.access.
 
+Behaviour switches are boolean "is_" flags in the config, so what is tested can be
+changed without editing the string values. Connection mode: is_use_direct_host,
+is_use_secret, is_use_static_token, is_use_db_user, is_pg_ssl, is_impersonate_directly.
+Sections: is_check_bq_to_gcs, is_check_bq_dry_run, is_check_common_tasks,
+is_check_cloud_run, is_check_gcs_to_postgresql, is_check_cloud_sql_instance,
+is_check_postgresql_connection, is_check_impersonation. When a flag is absent it
+defaults to the old behaviour (on when the related value is configured; sections on).
+
 Each check records PASS/FAIL/SKIP and testing continues after a failure. A
 report is printed at the end and the test fails if any check failed.
 Unconfigured placeholder values ("your-...") are skipped.
@@ -84,6 +92,12 @@ def _env_bool(name, default):
     return default if raw is None else raw.strip().lower() in ("1", "true", "yes")
 
 
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes")
+    return bool(value)
+
+
 class Report:
     def __init__(self, accounts, projects):
         self.accounts = accounts
@@ -127,7 +141,8 @@ class UserPermissionsTests(unittest.TestCase):
             raise unittest.SkipTest(f"config not found: {CONFIG_PATH}")
         cls.cfg = json.loads(CONFIG_PATH.read_text())
         cls.impersonate = _env_bool(
-            "PERMISSIONS_IMPERSONATE", bool(cls.cfg.get("impersonate_directly"))
+            "PERMISSIONS_IMPERSONATE",
+            cls._flag("is_impersonate_directly", cls.cfg.get("impersonate_directly", False)),
         )
         accounts = {
             "BigQuery/GCS": cls.cfg.get("impersonate_service_account")
@@ -160,6 +175,11 @@ class UserPermissionsTests(unittest.TestCase):
         cls.identity = "current ADC user"
         cls.current_adc_account = "current ADC user (email not resolved)"
         cls._identity_cache = {}
+
+    @classmethod
+    def _flag(cls, name, default):
+        """Boolean switch from the config; `default` applies when the key is absent."""
+        return _as_bool(cls.cfg[name]) if name in cls.cfg else _as_bool(default)
 
     def _use_identity(self, role, section):
         if not self.impersonate:
@@ -316,6 +336,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_02_bq_to_gcs_required(self):
         s = "bq_to_gcs required"
+        if not self._flag("is_check_bq_to_gcs", True):
+            return self.report.record(s, "section", "SKIP", "is_check_bq_to_gcs is false")
         if not self._use_identity("BigQuery/GCS", s):
             return
         if self._need(s, "bigquery_project"):
@@ -369,6 +391,8 @@ class UserPermissionsTests(unittest.TestCase):
     def test_03_bq_to_gcs_dry_run_access(self):
         """Practical end-to-end read check: dry-run query against the source table."""
         s = "bq_to_gcs required"
+        if not self._flag("is_check_bq_dry_run", True):
+            return self.report.record(s, "dry run", "SKIP", "is_check_bq_dry_run is false")
         if not self._use_identity("BigQuery/GCS", s):
             return
         if not self._need(s, "bigquery_project", "dataset_id", "table_id"):
@@ -405,6 +429,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_04_common_tasks(self):
         s = "common tasks"
+        if not self._flag("is_check_common_tasks", True):
+            return self.report.record(s, "section", "SKIP", "is_check_common_tasks is false")
         if not self._use_identity("BigQuery/GCS", s):
             return
         if self._need(s, "bigquery_project"):
@@ -435,7 +461,9 @@ class UserPermissionsTests(unittest.TestCase):
                 quote(self.cfg["destination_bucket"], safe=""),
                 GCS_COMMON_PERMS,
             )
-        if self._need(s, "cloud_run_project", "cloud_run_region", "cloud_run_service"):
+        if not self._flag("is_check_cloud_run", True):
+            self.report.record(s, "cloud run service", "SKIP", "is_check_cloud_run is false")
+        elif self._need(s, "cloud_run_project", "cloud_run_region", "cloud_run_service"):
             c = self.cfg
             self._test_iam(
                 s + " (cloud run service)",
@@ -446,6 +474,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_041_gcs_to_postgresql_gcp_permissions(self):
         s = "gcs_to_postgresql required"
+        if not self._flag("is_check_gcs_to_postgresql", True):
+            return self.report.record(s, "section", "SKIP", "is_check_gcs_to_postgresql is false")
         if not self._use_identity("PostgreSQL/GCS", s):
             return
         if self._need(s, "bigquery_project", "dataset_id", "table_id"):
@@ -469,7 +499,11 @@ class UserPermissionsTests(unittest.TestCase):
                 quote(self.cfg["destination_bucket"], safe=""),
                 PG_GCS_PERMS,
             )
-        if self._need(s, "pg_cloud_sql_connection_name"):
+        if not self._flag("is_check_cloud_sql_instance", True):
+            self.report.record(
+                s, "cloud sql instance", "SKIP", "is_check_cloud_sql_instance is false"
+            )
+        elif self._need(s, "pg_cloud_sql_connection_name"):
             parts = self.cfg["pg_cloud_sql_connection_name"].split(":")
             if len(parts) != 3:
                 self.report.record(
@@ -510,23 +544,37 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_042_postgresql_connection(self):
         s = "postgresql connection"
+        if not self._flag("is_check_postgresql_connection", True):
+            return self.report.record(
+                s, "section", "SKIP", "is_check_postgresql_connection is false"
+            )
         if not self._use_identity("PostgreSQL/GCS", s):
             return
         direct_host = self.cfg.get("pg_direct_host")
-        use_direct = _is_set(direct_host)
+        use_direct = self._flag("is_use_direct_host", _is_set(direct_host))
         static_token = (
             os.environ.get("PG_PASSWORD_TOKEN") or str(self.cfg.get("pg_password_token", ""))
         ).strip()
         static_token = static_token if _is_set(static_token) else ""
-        use_secret = _is_set(self.cfg.get("pg_secret_name")) and not static_token
-        user_key = (
-            "pg_db_user"
-            if use_secret and _is_set(self.cfg.get("pg_db_user"))
-            else "pg_db_iam_user"
+        if not self._flag("is_use_static_token", bool(static_token)):
+            static_token = ""
+        elif not static_token:
+            self.report.record(
+                s, "config", "SKIP", "is_use_static_token is true but no token is set"
+            )
+            return
+        use_secret = self._flag("is_use_secret", _is_set(self.cfg.get("pg_secret_name"))) and (
+            not static_token
         )
+        use_db_user = self._flag("is_use_db_user", _is_set(self.cfg.get("pg_db_user")))
+        user_key = "pg_db_user" if use_secret and use_db_user else "pg_db_iam_user"
         required = ["pg_db_name", user_key]
-        if not use_direct:
+        if use_direct:
+            required.append("pg_direct_host")
+        else:
             required.append("pg_cloud_sql_connection_name")
+        if use_secret:
+            required.append("pg_secret_name")
         if not self._need(s, *required):
             return
         db_user = self.cfg[user_key]
@@ -576,7 +624,7 @@ class UserPermissionsTests(unittest.TestCase):
                     token_creds.refresh(Request())
                     credential = token_creds.token
                 ssl_context = None
-                if self.cfg.get("pg_ssl", True):
+                if self._flag("is_pg_ssl", self.cfg.get("pg_ssl", True)):
                     # Equivalent to sslmode=require: encrypted, instance cert not verified
                     ssl_context = ssl.create_default_context()
                     ssl_context.check_hostname = False
@@ -655,6 +703,8 @@ class UserPermissionsTests(unittest.TestCase):
 
     def test_05_can_impersonate_service_account(self):
         s = "impersonation (current ADC user)"
+        if not self._flag("is_check_impersonation", True):
+            return self.report.record(s, "section", "SKIP", "is_check_impersonation is false")
         self.session = self.user_session
         self.identity = "current ADC user"
         self.report.current_account = self.current_adc_account

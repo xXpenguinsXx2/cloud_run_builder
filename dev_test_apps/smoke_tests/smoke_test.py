@@ -2,6 +2,7 @@ import json
 import fnmatch
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import google.auth
@@ -16,7 +17,6 @@ EXPORT_FIELDS = {
     "dataset_id": "SMOKE_TEST_DATASET_ID",
     "table_id": "SMOKE_TEST_TABLE_ID",
     "destination_bucket": "SMOKE_TEST_DESTINATION_BUCKET",
-    "destination_object": "SMOKE_TEST_DESTINATION_OBJECT",
     "location": "SMOKE_TEST_LOCATION",
     "format": "SMOKE_TEST_FORMAT",
     "compression": "SMOKE_TEST_COMPRESSION",
@@ -186,7 +186,14 @@ def run_export_smoke_test(function_url, timeout_seconds, request_headers=None):
         headers=request_headers,
     )
     body = response_body(response)
-    object_pattern = payload.get("destination_object", f"{payload['table_id']}.csv")
+    export_extension = {"PARQUET": "parquet", "NDJSON": "json", "JSON": "json",
+                        "NEWLINE_DELIMITED_JSON": "json"}.get(
+        payload.get("format", "CSV").strip().upper(), "csv"
+    )
+    object_pattern = (
+        f"{payload['table_id']}/{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+        f"/part_*.{export_extension}"
+    )
     expected_destination = (
         f"gs://{payload['destination_bucket']}/"
         f"{object_pattern}"

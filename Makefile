@@ -13,9 +13,10 @@ PROJECT_ID ?= jag-pgsql-gke
 IMAGE_TAG ?= local
 REGION ?= us-central1
 AR_REPOSITORY ?= cloud-run-source-deploy
-# No default: pass explicitly, e.g. `make deploy RUNTIME_SERVICE_ACCOUNT=name@project.iam.gserviceaccount.com`.
-# This is independent of cloudbuild.yaml's _RUNTIME_SERVICE_ACCOUNT substitution, which only applies to
-# Cloud Build-triggered deploys, not this local/manual `make` workflow.
+# Optional. When empty, `gcloud run deploy` is run without --service-account and Cloud Run uses the
+# project's default runtime identity. Set explicitly to override, e.g.
+# `make deploy RUNTIME_SERVICE_ACCOUNT=name@project.iam.gserviceaccount.com`.
+# This is independent of cloudbuild.yaml's _RUNTIME_SERVICE_ACCOUNT trigger substitution.
 RUNTIME_SERVICE_ACCOUNT ?=
 RUN_ENV_VARS ?=
 RUN_SECRETS ?=
@@ -56,14 +57,30 @@ push: check-project build
 	docker push "$(REMOTE_IMAGE)"
 
 deploy: check-deploy push
-	$(GCLOUD) run deploy "$(SERVICE_NAME)" --project="$(PROJECT_ID)" --region="$(REGION)" --image="$(REMOTE_IMAGE)" --service-account="$(RUNTIME_SERVICE_ACCOUNT)" --no-allow-unauthenticated --quiet $(if $(strip $(DEPLOY_ENV_VARS)),--update-env-vars="$(DEPLOY_ENV_VARS)") $(if $(strip $(RUN_SECRETS)),--update-secrets="$(RUN_SECRETS)") $(if $(strip $(CLOUD_SQL_CONNECTION_NAME)),--add-cloudsql-instances="$(CLOUD_SQL_CONNECTION_NAME)") $(if $(strip $(RUN_TIMEOUT_SECONDS)),--timeout="$(RUN_TIMEOUT_SECONDS)")
+	$(GCLOUD) run deploy "$(SERVICE_NAME)" --project="$(PROJECT_ID)" --region="$(REGION)" --image="$(REMOTE_IMAGE)" $(if $(strip $(RUNTIME_SERVICE_ACCOUNT)),--service-account="$(RUNTIME_SERVICE_ACCOUNT)") --no-allow-unauthenticated --quiet $(if $(strip $(DEPLOY_ENV_VARS)),--update-env-vars="$(DEPLOY_ENV_VARS)") $(if $(strip $(RUN_SECRETS)),--update-secrets="$(RUN_SECRETS)") $(if $(strip $(CLOUD_SQL_CONNECTION_NAME)),--add-cloudsql-instances="$(CLOUD_SQL_CONNECTION_NAME)") $(if $(strip $(RUN_TIMEOUT_SECONDS)),--timeout="$(RUN_TIMEOUT_SECONDS)")
 
 check-project:
-	$(if $(strip $(PROJECT_ID)),,$(error PROJECT_ID is required, for example make push PROJECT_ID=my-project))
+
+	@echo [check-project] PROJECT_ID=$(PROJECT_ID)
+	@echo [check-project] APP=$(APP)
+	@echo [check-project] REGION=$(REGION)
+	@echo [check-project] AR_REPOSITORY=$(AR_REPOSITORY)
+	@echo [check-project] IMAGE_TAG=$(IMAGE_TAG)
+	@echo [check-project] REMOTE_IMAGE=$(REMOTE_IMAGE)
+    $(if $(strip $(PROJECT_ID)),,$(error PROJECT_ID is required, for example make push PROJECT_ID=my-project))
 
 check-deploy:
+	@echo [check-deploy] PROJECT_ID=$(PROJECT_ID)
+	@echo [check-deploy] DEPLOY_ENV=$(DEPLOY_ENV)
+	@echo [check-deploy] SERVICE_NAME=$(SERVICE_NAME)
+	@echo [check-deploy] REGION=$(REGION)
+	@echo [check-deploy] REMOTE_IMAGE=$(REMOTE_IMAGE)
+	@echo [check-deploy] RUNTIME_SERVICE_ACCOUNT=$(if $(strip $(RUNTIME_SERVICE_ACCOUNT)),$(RUNTIME_SERVICE_ACCOUNT),(not set - Cloud Run default identity))
+	@echo [check-deploy] DEPLOY_ENV_VARS=$(DEPLOY_ENV_VARS)
+	@echo [check-deploy] RUN_SECRETS=$(RUN_SECRETS)
+	@echo [check-deploy] CLOUD_SQL_CONNECTION_NAME=$(CLOUD_SQL_CONNECTION_NAME)
+	@echo [check-deploy] RUN_TIMEOUT_SECONDS=$(RUN_TIMEOUT_SECONDS)
 	$(if $(strip $(PROJECT_ID)),,$(error PROJECT_ID is required, for example make deploy PROJECT_ID=my-project))
-	$(if $(strip $(RUNTIME_SERVICE_ACCOUNT)),,$(error RUNTIME_SERVICE_ACCOUNT is required for Cloud Run deploy))
 
 release: deploy
 

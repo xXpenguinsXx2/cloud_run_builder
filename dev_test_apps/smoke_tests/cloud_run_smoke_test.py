@@ -68,14 +68,8 @@ def main():
     os.environ["SMOKE_TEST_FORMAT"] = args.format
     if args.format == "PARQUET":
         os.environ["SMOKE_TEST_COMPRESSION"] = "SNAPPY"
-        os.environ["SMOKE_TEST_DESTINATION_OBJECT"] = (
-            "example/cloud-run-export-*.parquet"
-        )
     else:
         os.environ.pop("SMOKE_TEST_COMPRESSION", None)
-        os.environ["SMOKE_TEST_DESTINATION_OBJECT"] = (
-            "example/cloud-run-export-*.csv"
-        )
 
     try:
         service_url = get_cloud_run_service_url(

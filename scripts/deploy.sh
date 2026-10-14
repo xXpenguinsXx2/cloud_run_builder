@@ -23,10 +23,12 @@ for dockerfile in "${app_dockerfiles[@]}"; do
     "--project=$PROJECT_ID"
     "--region=$DEPLOY_REGION"
     "--image=$image_uri"
-    "--service-account=$RUNTIME_SERVICE_ACCOUNT"
     --no-allow-unauthenticated
     --quiet
   )
+  if [[ -n "$RUNTIME_SERVICE_ACCOUNT" ]]; then
+    deploy_args+=("--service-account=$RUNTIME_SERVICE_ACCOUNT")
+  fi
 
   env_vars="${RUN_ENV_VARS:-}"
   if [[ -n "${CLOUD_SQL_CONNECTION_NAME:-}" ]]; then
