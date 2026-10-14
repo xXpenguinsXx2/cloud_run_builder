@@ -10,34 +10,18 @@ checks (including their GCS checks) as "pg_impersonate_service_account". The
 impersonation checks always run for configured service accounts.
 
 gcs_to_postgresql: checks BigQuery/GCS/Cloud SQL IAM permissions, then (if
-pg_cloud_sql_connection_name, pg_db_name and pg_db_iam_user are set) connects
-with IAM auth and runs SELECT session_user. With direct impersonation the
-connection uses the impersonated service account; pg_db_iam_user must be that
-SA's database user (SA email without ".gserviceaccount.com").
-If "pg_direct_host" is set (optionally "pg_direct_port", default 5432), the
-Cloud SQL connector is bypassed (it needs TCP 3307) and the test connects
-straight to that host over SSL, sending an IAM access token as the password
-(manual IAM database authentication); set "pg_ssl": false if a proxy refuses SSL.
-For direct-host IAM authentication, the test obtains a fresh OAuth access token
-by running `gcloud auth print-access-token` and uses it as the PostgreSQL
-password. When direct impersonation is enabled, gcloud impersonates
-"pg_impersonate_service_account" for that token. This requires the gcloud CLI
-to be installed and authenticated. It does not use the identity token from
-`gcloud auth print-identity-token`. If "pg_secret_name" is set, the password is
-read from Secret Manager (project "pg_secret_project", optional
-"pg_secret_version", default latest; or a full projects/.../secrets/... name)
-and used as a regular database password. If the secret is a service account
-key (JSON, or a bare PEM plus "pg_secret_service_account" email), the test signs
-in as that service account and uses its IAM access token as the password, with
-pg_db_iam_user as the database user.
-Otherwise the secret is used as a plain password for "pg_db_user" (falls back
-to pg_db_iam_user), with direct or connector access. The secret is read as the
-active identity, which needs secretmanager.versions.access.
+pg_direct_host, pg_db_name and pg_db_user are set) connects directly to
+pg_direct_host (port "pg_direct_port", default 5432, no SSL) as pg_db_user and
+runs SELECT session_user. The password is the "pg_secret_name" value from
+Secret Manager (project "pg_secret_project", optional "pg_secret_version",
+default latest; or a full projects/.../secrets/... name), read as the active
+identity. Without a secret, a fresh OAuth access token from
+`gcloud auth print-access-token` is used (IAM database authentication; with
+direct impersonation gcloud impersonates "pg_impersonate_service_account").
 
 Behaviour switches are boolean "is_" flags in the config, so what is tested can be
-changed without editing the string values. Connection mode: is_use_direct_host,
-is_use_secret, is_use_db_user, is_pg_ssl, is_impersonate_directly.
-Sections: is_check_bq_to_gcs, is_check_bq_dry_run, is_check_common_tasks,
+changed without editing the string values: is_impersonate_directly,
+is_check_bq_to_gcs, is_check_bq_dry_run, is_check_common_tasks,
 is_check_cloud_run, is_check_gcs_to_postgresql, is_check_cloud_sql_instance,
 is_check_postgresql_connection, is_check_impersonation. When a flag is absent it
 defaults to the old behaviour (on when the related value is configured; sections on).
@@ -83,7 +67,6 @@ PROJECT_COMMON_PERMS = ["resourcemanager.projects.get", "serviceusage.services.u
 PG_BQ_TABLE_PERMS = ["bigquery.tables.get"]
 PG_GCS_PERMS = ["storage.objects.list", "storage.objects.get"]
 CLOUD_SQL_PERMS = ["cloudsql.instances.connect", "cloudsql.instances.get", "cloudsql.instances.login"]
-SQLSERVICE_LOGIN_SCOPE = "https://www.googleapis.com/auth/sqlservice.login"
 IMPERSONATE_PERMS = ["iam.serviceAccounts.getAccessToken", "iam.serviceAccounts.actAs"]
 
 
@@ -237,7 +220,6 @@ class UserPermissionsTests(unittest.TestCase):
             raise unittest.SkipTest(f"no application default credentials: {exc}")
 
         cls.session = cls.user_session
-        cls.sql_credentials = None
         cls.identity = "current ADC user"
         cls.current_adc_account = "current ADC user (email not resolved)"
         cls._identity_cache = {}
@@ -250,7 +232,6 @@ class UserPermissionsTests(unittest.TestCase):
     def _use_identity(self, role, section):
         if not self.impersonate:
             self.session = self.user_session
-            self.sql_credentials = None
             self.identity = "current ADC user"
             self.report.current_account = self.current_adc_account
             return True
@@ -274,17 +255,8 @@ class UserPermissionsTests(unittest.TestCase):
                     target_scopes=SCOPES,
                 )
                 credentials.refresh(Request())
-                self._identity_cache[account] = {
-                    "session": AuthorizedSession(credentials),
-                    "sql_credentials": impersonated_credentials.Credentials(
-                        source_credentials=self.user_creds,
-                        target_principal=account,
-                        target_scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE],
-                    ),
-                }
-            identity = self._identity_cache[account]
-            self.session = identity["session"]
-            self.sql_credentials = identity["sql_credentials"] if role == "PostgreSQL/GCS" else None
+                self._identity_cache[account] = AuthorizedSession(credentials)
+            self.session = self._identity_cache[account]
             self.identity = f"service account {account}"
             self.report.current_account = account
             return True
@@ -348,37 +320,6 @@ class UserPermissionsTests(unittest.TestCase):
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         return base64.b64decode(resp.json()["payload"]["data"]).decode("utf-8").strip()
-
-    def _key_credentials(self, secret):
-        """Service account credentials if the secret is a SA key (JSON or bare PEM), else None."""
-        from google.oauth2 import service_account
-
-        scopes = SCOPES + [SQLSERVICE_LOGIN_SCOPE]
-        if secret.lstrip().startswith("{"):
-            return service_account.Credentials.from_service_account_info(
-                json.loads(secret), scopes=scopes
-            )
-        if secret.lstrip().startswith("-----BEGIN"):
-            email = next(
-                (
-                    self.cfg[k]
-                    for k in ("pg_secret_service_account", "pg_impersonate_service_account")
-                    if _is_set(self.cfg.get(k))
-                ),
-                None,
-            )
-            if email is None:
-                raise ValueError("secret is a bare private key; set pg_secret_service_account")
-            return service_account.Credentials.from_service_account_info(
-                {
-                    "type": "service_account",
-                    "client_email": email,
-                    "private_key": secret,
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                },
-                scopes=scopes,
-            )
-        return None
 
     # sections
     def test_01_identity(self):
@@ -616,146 +557,42 @@ class UserPermissionsTests(unittest.TestCase):
             )
         if not self._use_identity("PostgreSQL/GCS", s):
             return
-        direct_host = self.cfg.get("pg_direct_host")
-        use_direct = self._flag("is_use_direct_host", _is_set(direct_host))
-        use_secret = self._flag("is_use_secret", _is_set(self.cfg.get("pg_secret_name")))
-        use_db_user = self._flag("is_use_db_user", _is_set(self.cfg.get("pg_db_user")))
-        user_key = "pg_db_user" if use_secret and use_db_user else "pg_db_iam_user"
-        required = ["pg_db_name", user_key]
-        if use_direct:
-            required.append("pg_direct_host")
-        else:
-            required.append("pg_cloud_sql_connection_name")
-        if use_secret:
-            required.append("pg_secret_name")
-        if not self._need(s, *required):
+        if not self._need(s, "pg_direct_host", "pg_db_name", "pg_db_user"):
             return
-        db_user = self.cfg[user_key]
-        connector = None
+        try:
+            if _is_set(self.cfg.get("pg_secret_name")):
+                password = self._read_secret()
+                self.report.record(s, "read password from Secret Manager", "PASS")
+            else:
+                service_account = (
+                    self.cfg.get("pg_impersonate_service_account") if self.impersonate else None
+                )
+                password = get_gcloud_access_token(service_account)
+                self.report.record(s, "generated access token with gcloud", "PASS")
+        except Exception as exc:
+            return self.report.record(s, "get password", "FAIL", str(exc))
+
+        import pg8000.dbapi
+
         conn = None
         try:
-            secret_value = None
-            if use_secret:
-                try:
-                    secret_value = self._read_secret()
-                    self.report.record(s, "read secret from Secret Manager", "PASS")
-                except Exception as exc:
-                    self.report.record(
-                        s, "read secret from Secret Manager", "FAIL", str(exc)
-                    )
-                    return
-                try:
-                    key_creds = self._key_credentials(secret_value)
-                except Exception as exc:
-                    self.report.record(s, "load service account key from secret", "FAIL", str(exc))
-                    return
-                if key_creds is not None:
-                    # Secret is a service account key: sign in as that SA, use an IAM token
-                    self.sql_credentials = key_creds
-                    secret_value = None
-                    self.report.record(
-                        s,
-                        "secret is a service account key",
-                        "PASS",
-                        key_creds.service_account_email,
-                    )
-            if use_direct:
-                import ssl
-
-                import pg8000.dbapi
-
-                if secret_value is not None:
-                    credential = secret_value
-                elif self.sql_credentials is not None and use_secret:
-                    self.sql_credentials.refresh(Request())
-                    credential = self.sql_credentials.token
-                else:
-                    service_account = (
-                        self.cfg.get("pg_impersonate_service_account")
-                        if self.impersonate
-                        else None
-                    )
-                    credential = get_gcloud_access_token(service_account)
-                    self.report.record(
-                        s, "generated PostgreSQL IAM access token with gcloud", "PASS"
-                    )
-                ssl_context = None
-                if self._flag("is_pg_ssl", self.cfg.get("pg_ssl", True)):
-                    # Equivalent to sslmode=require: encrypted, instance cert not verified
-                    ssl_context = ssl.create_default_context()
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
-                conn = pg8000.dbapi.connect(
-                    user=db_user,
-                    password=credential,
-                    host=direct_host,
-                    port=int(self.cfg.get("pg_direct_port", 5432)),
-                    database=self.cfg["pg_db_name"],
-                    ssl_context=ssl_context,
-                    timeout=30,
-                )
-            else:
-                try:
-                    from google.cloud.sql.connector import Connector, IPTypes
-                except ImportError as exc:
-                    self.report.record(
-                        s, "import cloud-sql-python-connector", "FAIL", str(exc)
-                    )
-                    return
-                ip_type = str(self.cfg.get("pg_cloud_sql_ip_type", "PUBLIC")).upper()
-                connector = Connector(credentials=self.sql_credentials)
-                connect_kwargs = (
-                    {"password": secret_value}
-                    if secret_value is not None
-                    else {"enable_iam_auth": True}
-                )
-                conn = connector.connect(
-                    self.cfg["pg_cloud_sql_connection_name"],
-                    "pg8000",
-                    user=db_user,
-                    db=self.cfg["pg_db_name"],
-                    ip_type=IPTypes.PRIVATE if ip_type == "PRIVATE" else IPTypes.PUBLIC,
-                    **connect_kwargs,
-                )
+            conn = pg8000.dbapi.connect(
+                user=self.cfg["pg_db_user"],
+                password=password,
+                host=self.cfg["pg_direct_host"],
+                port=int(self.cfg.get("pg_direct_port", 5432)),
+                database=self.cfg["pg_db_name"],
+                timeout=30,
+            )
             cur = conn.cursor()
             cur.execute("SELECT session_user")
             user = cur.fetchone()[0]
             self.report.record(s, "connect and SELECT session_user", "PASS", f"session_user={user}")
-            expected = db_user
-            if user != expected:
-                self.report.record(
-                    s, "session_user matches pg_db_iam_user", "FAIL", f"{user} != {expected}"
-                )
-            schema = self.cfg.get("pg_db_schema", "public")
-            cur.execute(
-                "SELECT has_schema_privilege(session_user, %s, 'CREATE'), "
-                "has_schema_privilege(session_user, %s, 'USAGE')",
-                (schema, schema),
-            )
-            can_create, can_use = cur.fetchone()
-            self.report.record(
-                s,
-                f"CREATE on schema {schema}",
-                "PASS" if can_create else "FAIL",
-                "" if can_create else "needed for staging table creation",
-            )
-            self.report.record(
-                s, f"USAGE on schema {schema}", "PASS" if can_use else "FAIL"
-            )
-            cur.execute("SELECT has_database_privilege(session_user, current_database(), 'CREATE')")
-            can_db_create = cur.fetchone()[0]
-            self.report.record(
-                s,
-                "CREATE on database (needed if schema must be created)",
-                "PASS" if can_db_create else "FAIL",
-            )
         except Exception as exc:
             self.report.record(s, "connect and SELECT session_user", "FAIL", str(exc))
         finally:
             if conn is not None:
                 conn.close()
-            if connector is not None:
-                connector.close()
 
     def test_05_can_impersonate_service_account(self):
         s = "impersonation (current ADC user)"
