@@ -18,23 +18,25 @@ If "pg_direct_host" is set (optionally "pg_direct_port", default 5432), the
 Cloud SQL connector is bypassed (it needs TCP 3307) and the test connects
 straight to that host over SSL, sending an IAM access token as the password
 (manual IAM database authentication); set "pg_ssl": false if a proxy refuses SSL.
-If "pg_secret_name" is set, the password is read from Secret Manager (project
-"pg_secret_project", optional "pg_secret_version", default latest; or a full
-projects/.../secrets/... name). To pass a token you already have (e.g. the output
-of gcloud auth print-access-token / generate-identity-token, as used in DBeaver),
-set env PG_PASSWORD_TOKEN or "pg_password_token"; it is used verbatim as the
-password for pg_db_iam_user and takes precedence over the secret. Tokens expire
-(about 1 hour), so refresh it before each run.
-If the secret is a service account key (JSON, or a
-bare PEM plus "pg_secret_service_account" email), the test signs in as that service
-account and uses its IAM access token as the password, with pg_db_iam_user as the
-database user. Otherwise the secret is used as a plain password for
-"pg_db_user" (falls back to pg_db_iam_user), with direct or connector access.
-The secret is read as the active identity, which needs secretmanager.versions.access.
+For direct-host IAM authentication, the test obtains a fresh OAuth access token
+by running `gcloud auth print-access-token` and uses it as the PostgreSQL
+password. When direct impersonation is enabled, gcloud impersonates
+"pg_impersonate_service_account" for that token. This requires the gcloud CLI
+to be installed and authenticated. It does not use the identity token from
+`gcloud auth print-identity-token`. If "pg_secret_name" is set, the password is
+read from Secret Manager (project "pg_secret_project", optional
+"pg_secret_version", default latest; or a full projects/.../secrets/... name)
+and used as a regular database password. If the secret is a service account
+key (JSON, or a bare PEM plus "pg_secret_service_account" email), the test signs
+in as that service account and uses its IAM access token as the password, with
+pg_db_iam_user as the database user.
+Otherwise the secret is used as a plain password for "pg_db_user" (falls back
+to pg_db_iam_user), with direct or connector access. The secret is read as the
+active identity, which needs secretmanager.versions.access.
 
 Behaviour switches are boolean "is_" flags in the config, so what is tested can be
 changed without editing the string values. Connection mode: is_use_direct_host,
-is_use_secret, is_use_static_token, is_use_db_user, is_pg_ssl, is_impersonate_directly.
+is_use_secret, is_use_db_user, is_pg_ssl, is_impersonate_directly.
 Sections: is_check_bq_to_gcs, is_check_bq_dry_run, is_check_common_tasks,
 is_check_cloud_run, is_check_gcs_to_postgresql, is_check_cloud_sql_instance,
 is_check_postgresql_connection, is_check_impersonation. When a flag is absent it
@@ -49,8 +51,10 @@ Run: python -m unittest test_user_permissions -v
 import base64
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 from urllib.parse import quote
 
 import google.auth
@@ -81,6 +85,68 @@ PG_GCS_PERMS = ["storage.objects.list", "storage.objects.get"]
 CLOUD_SQL_PERMS = ["cloudsql.instances.connect", "cloudsql.instances.get", "cloudsql.instances.login"]
 SQLSERVICE_LOGIN_SCOPE = "https://www.googleapis.com/auth/sqlservice.login"
 IMPERSONATE_PERMS = ["iam.serviceAccounts.getAccessToken", "iam.serviceAccounts.actAs"]
+
+
+def get_gcloud_access_token(service_account=None):
+    """Get a fresh OAuth access token from gcloud for PostgreSQL IAM auth."""
+    command = ["gcloud", "auth", "print-access-token"]
+    if service_account:
+        command.extend(["--impersonate-service-account", service_account])
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    )
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError("gcloud auth print-access-token returned an empty token")
+    return token
+
+
+class GcloudAccessTokenTests(unittest.TestCase):
+    @patch("subprocess.run")
+    def test_generates_and_returns_access_token(self, run):
+        run.return_value = Mock(stdout=" fresh-token\n")
+
+        token = get_gcloud_access_token()
+
+        self.assertEqual(token, "fresh-token")
+        run.assert_called_once_with(
+            ["gcloud", "auth", "print-access-token"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=30,
+        )
+
+    @patch("subprocess.run")
+    def test_generates_token_as_impersonated_service_account(self, run):
+        run.return_value = Mock(stdout="service-account-token\n")
+
+        token = get_gcloud_access_token("pg-importer@example.iam.gserviceaccount.com")
+
+        self.assertEqual(token, "service-account-token")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "gcloud",
+                "auth",
+                "print-access-token",
+                "--impersonate-service-account",
+                "pg-importer@example.iam.gserviceaccount.com",
+            ],
+        )
+
+    @patch("subprocess.run")
+    def test_rejects_empty_access_token(self, run):
+        run.return_value = Mock(stdout=" \n")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "gcloud auth print-access-token returned an empty token"
+        ):
+            get_gcloud_access_token()
 
 
 def _is_set(value):
@@ -552,20 +618,7 @@ class UserPermissionsTests(unittest.TestCase):
             return
         direct_host = self.cfg.get("pg_direct_host")
         use_direct = self._flag("is_use_direct_host", _is_set(direct_host))
-        static_token = (
-            os.environ.get("PG_PASSWORD_TOKEN") or str(self.cfg.get("pg_password_token", ""))
-        ).strip()
-        static_token = static_token if _is_set(static_token) else ""
-        if not self._flag("is_use_static_token", bool(static_token)):
-            static_token = ""
-        elif not static_token:
-            self.report.record(
-                s, "config", "SKIP", "is_use_static_token is true but no token is set"
-            )
-            return
-        use_secret = self._flag("is_use_secret", _is_set(self.cfg.get("pg_secret_name"))) and (
-            not static_token
-        )
+        use_secret = self._flag("is_use_secret", _is_set(self.cfg.get("pg_secret_name")))
         use_db_user = self._flag("is_use_db_user", _is_set(self.cfg.get("pg_db_user")))
         user_key = "pg_db_user" if use_secret and use_db_user else "pg_db_iam_user"
         required = ["pg_db_name", user_key]
@@ -581,9 +634,7 @@ class UserPermissionsTests(unittest.TestCase):
         connector = None
         conn = None
         try:
-            secret_value = static_token or None
-            if static_token:
-                self.report.record(s, "using supplied token as password", "PASS")
+            secret_value = None
             if use_secret:
                 try:
                     secret_value = self._read_secret()
@@ -615,14 +666,19 @@ class UserPermissionsTests(unittest.TestCase):
 
                 if secret_value is not None:
                     credential = secret_value
+                elif self.sql_credentials is not None and use_secret:
+                    self.sql_credentials.refresh(Request())
+                    credential = self.sql_credentials.token
                 else:
-                    token_creds = self.sql_credentials
-                    if token_creds is None:
-                        token_creds, _ = google.auth.default(
-                            scopes=SCOPES + [SQLSERVICE_LOGIN_SCOPE]
-                        )
-                    token_creds.refresh(Request())
-                    credential = token_creds.token
+                    service_account = (
+                        self.cfg.get("pg_impersonate_service_account")
+                        if self.impersonate
+                        else None
+                    )
+                    credential = get_gcloud_access_token(service_account)
+                    self.report.record(
+                        s, "generated PostgreSQL IAM access token with gcloud", "PASS"
+                    )
                 ssl_context = None
                 if self._flag("is_pg_ssl", self.cfg.get("pg_ssl", True)):
                     # Equivalent to sslmode=require: encrypted, instance cert not verified
