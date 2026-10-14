@@ -16,7 +16,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-HISTORY_OBJECT = "history/export_history.csv"
+HISTORY_OBJECT = "services/history/export_history.csv"
+LEGACY_HISTORY_OBJECT = "history/export_history.csv"
 HISTORY_HEADER = [
     "exported_table",
     "destination",
@@ -27,6 +28,12 @@ HISTORY_HEADER = [
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
+def get_history_blob(bucket):
+    """Read the new history object, falling back to its former location."""
+    blob = bucket.get_blob(HISTORY_OBJECT)
+    return blob if blob is not None else bucket.get_blob(LEGACY_HISTORY_OBJECT)
+
+
 def append_history(bucket, row, attempts=5):
     """Append a row (dict keyed by HISTORY_HEADER) to the CSV history object.
     GCS objects can't be appended to, so the file is rewritten guarded by a
@@ -35,13 +42,13 @@ def append_history(bucket, row, attempts=5):
     blob = bucket.blob(HISTORY_OBJECT)
     for _ in range(attempts):
         existing = bucket.get_blob(HISTORY_OBJECT)
+        generation = 0 if existing is None else existing.generation
+        if existing is None:
+            existing = bucket.get_blob(LEGACY_HISTORY_OBJECT)
         out = io.StringIO()
         writer = csv.DictWriter(out, fieldnames=HISTORY_HEADER, lineterminator="\n")
         writer.writeheader()
-        if existing is None:
-            generation = 0
-        else:
-            generation = existing.generation
+        if existing is not None:
             for old in csv.DictReader(io.StringIO(existing.download_as_text())):
                 normalized = {k: old.get(k) or "" for k in HISTORY_HEADER}
                 normalized["status"] = normalized["status"] or "success"
@@ -63,7 +70,7 @@ EPOCH_DEFAULT = datetime(1900, 1, 1, tzinfo=timezone.utc)
 def get_latest_extract(bucket, exported_table):
     """Return (finished_at, destination_uri) of the latest *successful* export
     for exported_table, or (1900-01-01, None) if there is none."""
-    blob = bucket.get_blob(HISTORY_OBJECT)
+    blob = get_history_blob(bucket)
     if blob is None:
         return EPOCH_DEFAULT, None
     latest, destination = EPOCH_DEFAULT, None
@@ -122,8 +129,8 @@ def export_table_to_gcs(request: Request):
     - format (optional; CSV|NEWLINE_DELIMITED_JSON|PARQUET)
     - compression (optional; BigQuery extract compression, such as SNAPPY)
 
-    Files are written to gs://<destination_bucket>/<table_id>/<YYYYMMDD>/part_*.<ext>
-    and the schema to gs://<destination_bucket>/<table_id>/<table_id>_schema.json.
+    Files are written to gs://<destination_bucket>/services/exports/<table_id>/<YYYYMMDD>/part_*.<ext>
+    and the schema to gs://<destination_bucket>/services/exports/<table_id>/<table_id>_schema.json.
     """
     ctx = {}
     try:
@@ -168,10 +175,11 @@ def export_table_to_gcs(request: Request):
             logger.warning("Export request rejected: unsupported format %s", fmt)
             return jsonify({"error": "unsupported format"}), 400
 
-        # gs://<bucket>/<table_id>/<YYYYMMDD (UTC)>/part_*.<format>
+        # gs://<bucket>/services/exports/<table_id>/<YYYYMMDD (UTC)>/part_*.<format>
         export_date = datetime.now(timezone.utc).strftime("%Y%m%d")
         destination_uri = (
-            f"gs://{destination_bucket}/{table_id}/{export_date}/part_*.{extension}"
+            f"gs://{destination_bucket}/services/exports/{table_id}/"
+            f"{export_date}/part_*.{extension}"
         )
         logger.info(
             "Preparing export: source=%s:%s.%s destination=%s location=%s format=%s compression=%s",
@@ -243,7 +251,9 @@ def export_table_to_gcs(request: Request):
                 200,
             )
 
-        schema_object = f"{table_id}/{table_id}_schema.json"
+        schema_object = (
+            f"services/exports/{table_id}/{table_id}_schema.json"
+        )
         bucket.blob(schema_object).upload_from_string(
             json.dumps([f.to_api_repr() for f in table.schema], indent=2),
             content_type="application/json",

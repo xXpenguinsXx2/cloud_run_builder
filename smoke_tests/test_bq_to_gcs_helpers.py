@@ -9,7 +9,7 @@ from flask import Flask, request
 APP_DIR = Path(__file__).resolve().parents[1] / "apps" / "bq_to_gcs_helpers"
 sys.path.insert(0, str(APP_DIR))
 
-from main import export_table_to_gcs, get_latest_extract_time
+from main import append_history, export_table_to_gcs, get_latest_extract_time
 
 
 class BigQueryToGcsSmokeTests(unittest.TestCase):
@@ -79,19 +79,22 @@ class BigQueryToGcsSmokeTests(unittest.TestCase):
             {
                 "status": "success",
                 "exported": "test-project:test_dataset.test_table",
-                "destination": "gs://test-bucket/test_table/20261014/part_*.csv",
-                "latest_folder": "gs://test-bucket/test_table/20261014/",
+                "destination": "gs://test-bucket/services/exports/test_table/20261014/part_*.csv",
+                "latest_folder": "gs://test-bucket/services/exports/test_table/20261014/",
                 "export_skipped": False,
                 "source_modified_time": "2026-10-14T12:00:00Z",
-                "schema": "gs://test-bucket/test_table/test_table_schema.json",
-                "history": "gs://test-bucket/history/export_history.csv",
+                "schema": "gs://test-bucket/services/exports/test_table/test_table_schema.json",
+                "history": "gs://test-bucket/services/history/export_history.csv",
                 "last_extract_time": "2026-10-14T15:00:00Z",
                 "previous_extract_time": "1900-01-01T00:00:00Z",
             },
         )
         self.assertEqual(
             [c[0][0] for c in bucket.blob.call_args_list],
-            ["test_table/test_table_schema.json", "history/export_history.csv"],
+            [
+                "services/exports/test_table/test_table_schema.json",
+                "services/history/export_history.csv",
+            ],
         )
         uploads = blob.upload_from_string.call_args_list
         self.assertIn('"name": "id"', uploads[0][0][0])
@@ -103,7 +106,7 @@ class BigQueryToGcsSmokeTests(unittest.TestCase):
         )
         self.assertIn(
             "test-project.test_dataset.test_table,"
-            "gs://test-bucket/test_table/20261014/part_*.csv,"
+            "gs://test-bucket/services/exports/test_table/20261014/part_*.csv,"
             "2026-10-14T15:00:00Z,success,2026-10-14T12:00:00Z",
             history_csv,
         )
@@ -119,7 +122,8 @@ class BigQueryToGcsSmokeTests(unittest.TestCase):
         bucket.get_blob.return_value.download_as_text.return_value = (
             "exported_table,destination,finished_at_utc\n"
             "test-project.test_dataset.test_table,"
-            "gs://test-bucket/test_table/20261013/part_*.csv,2026-10-13T10:00:00Z\n"
+            "gs://test-bucket/services/exports/test_table/20261013/part_*.csv,"
+            "2026-10-13T10:00:00Z\n"
         )
         return client, self.call_handler(
             {
@@ -139,7 +143,10 @@ class BigQueryToGcsSmokeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         body = response.get_json()
         self.assertTrue(body["export_skipped"])
-        self.assertEqual(body["latest_folder"], "gs://test-bucket/test_table/20261013/")
+        self.assertEqual(
+            body["latest_folder"],
+            "gs://test-bucket/services/exports/test_table/20261013/",
+        )
         self.assertEqual(body["last_extract_time"], "2026-10-13T10:00:00Z")
         client.extract_table.assert_not_called()
         bucket = mock_storage.return_value.bucket.return_value
@@ -185,6 +192,73 @@ class LatestExtractTimeTests(unittest.TestCase):
         bucket.get_blob.return_value = None
         self.assertEqual(
             get_latest_extract_time(bucket, "p.d.t").year, 1900
+        )
+
+    def test_reads_history_from_legacy_location(self):
+        bucket = Mock()
+        bucket.get_blob.side_effect = [
+            None,
+            Mock(
+                download_as_text=Mock(
+                    return_value=(
+                        "exported_table,destination,finished_at_utc\n"
+                        "p.d.t,gs://bucket/old-export.csv,2026-10-13T10:00:00Z\n"
+                    )
+                )
+            ),
+        ]
+
+        self.assertEqual(
+            get_latest_extract_time(bucket, "p.d.t"),
+            datetime(2026, 10, 13, 10, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            [call.args[0] for call in bucket.get_blob.call_args_list],
+            ["services/history/export_history.csv", "history/export_history.csv"],
+        )
+
+    def test_appending_history_copies_legacy_rows_to_new_location(self):
+        bucket = Mock()
+        bucket.name = "test-bucket"
+        legacy_blob = Mock(
+            generation=3,
+            download_as_text=Mock(
+                return_value=(
+                    "exported_table,destination,finished_at_utc\n"
+                    "p.d.t,gs://bucket/old-export.csv,2026-10-13T10:00:00Z\n"
+                )
+            ),
+        )
+        bucket.get_blob.side_effect = [None, legacy_blob]
+        new_blob = bucket.blob.return_value
+
+        history_uri = append_history(
+            bucket,
+            {
+                "exported_table": "p.d.t",
+                "destination": "gs://bucket/services/exports/t/20261014/part_*.csv",
+                "finished_at_utc": "2026-10-14T10:00:00Z",
+                "status": "success",
+                "source_modified_time": "2026-10-14T09:00:00Z",
+            },
+        )
+
+        self.assertEqual(
+            history_uri, "gs://test-bucket/services/history/export_history.csv"
+        )
+        new_blob.upload_from_string.assert_called_once()
+        self.assertEqual(
+            new_blob.upload_from_string.call_args.kwargs["if_generation_match"], 0
+        )
+        migrated_history = new_blob.upload_from_string.call_args.args[0]
+        self.assertIn(
+            "p.d.t,gs://bucket/old-export.csv,2026-10-13T10:00:00Z,success,",
+            migrated_history,
+        )
+        self.assertIn(
+            "p.d.t,gs://bucket/services/exports/t/20261014/part_*.csv,"
+            "2026-10-14T10:00:00Z,success,2026-10-14T09:00:00Z",
+            migrated_history,
         )
 
     def test_returns_latest_row_for_table(self):
