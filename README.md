@@ -37,13 +37,16 @@ make list-apps
 make build
 make build APP=bq_to_gcs IMAGE_TAG=local
 make build-all IMAGE_TAG=local
+make run APP=gcs_to_postgresql DEPLOY_ENV=dev
 make push APP=bq_to_gcs IMAGE_TAG=dev
 make deploy APP=bq_to_gcs REGION=us-central1 \
   IMAGE_TAG=dev RUNTIME_SERVICE_ACCOUNT=bq-export@jag-pgsql-gke.iam.gserviceaccount.com \
   RUN_SECRETS=API_TOKEN=api-token:latest
 ```
 
-`deploy` builds and pushes the selected image before deploying it. `deploy`, `release`, and `check-deploy` automatically load `apps/<APP>/deploy/<DEPLOY_ENV>.env` when it exists, including `RUN_ENV_VARS`, `RUN_SECRETS`, `SERVICE_NAME`, and `RUN_TIMEOUT_SECONDS`. Explicit Make command-line assignments override the file. If no file exists, command-line values and defaults are used. The config is applied to the Cloud Run runtime, not baked into the image; editing it requires deploying a new revision. Use `make -n deploy APP=gcs_to_postgresql DEPLOY_ENV=dev` to preview the deployment without building or changing cloud resources.
+`deploy` builds and pushes the selected image before deploying it. `run`, `deploy`, `release`, and `check-deploy` automatically load `apps/<APP>/deploy/<DEPLOY_ENV>.env` when it exists, including `RUN_ENV_VARS`, `RUN_SECRETS`, `SERVICE_NAME`, and `RUN_TIMEOUT_SECONDS`. Explicit Make command-line assignments override the file. If no file exists, command-line values and defaults are used. The config is applied at runtime, not baked into the image; editing it requires restarting the local container or deploying a new Cloud Run revision. `make build` alone does not apply runtime settings. Use `make -n deploy APP=gcs_to_postgresql DEPLOY_ENV=dev` to preview the deployment without building or changing cloud resources.
+
+`make run` builds the selected app, then runs it in the foreground with `--rm`, passing each comma-separated `RUN_ENV_VARS` entry as a Docker environment variable. Values must not contain commas. `CLOUD_SQL_CONNECTION_NAME`, when configured, is also passed as an environment variable; this does not start a Cloud SQL proxy or attach an instance locally. The default port mapping is `127.0.0.1:8080:8080`. Override `RUN_ARGS` to change ports or add Docker options such as read-only Application Default Credentials mounts; include a port mapping in the override if needed. Apps that access Google Cloud still need local credentials and the appropriate permissions. Cloud Run-only settings (`RUN_SECRETS`, runtime service accounts, and request timeouts) are not applied locally, and Secret Manager references are not automatically resolved by Docker. For a local secret, export it in your shell and pass its name, for example `RUN_ARGS="-p 127.0.0.1:8080:8080 --env DB_PASSWORD"`. Stop the container with Ctrl+C. Use `make -n run APP=gcs_to_postgresql DEPLOY_ENV=dev` to preview the build and run commands.
 
 The service stays private. The runtime service account comes from `RUNTIME_SERVICE_ACCOUNT`, or `CLOUD_RUN_SERVICE_ACCOUNT` when no explicit account is configured; if neither is set, Cloud Run uses its default identity. The `RUN_SECRETS` value contains Secret Manager references, not secret values. The runtime service account must have access to those secrets. `DEPLOY_ENV` defaults to `dev`; set `DEPLOY_ENV=stage` or `DEPLOY_ENV=prod` for manual stage/prod deployments.
 

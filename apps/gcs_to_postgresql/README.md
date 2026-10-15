@@ -34,6 +34,28 @@ The HTTP service is private by default. Callers must be granted Cloud Run Invoke
 
 ### Connection test
 
+To debug the deployed importer without importing data, POST the [debug request example](../../dev_test_apps/smoke_tests/debug-request.json) to the service root:
+
+```json
+{
+  "action": "debug"
+}
+```
+
+This uses the service's current runtime configuration (not values from your local config file). It returns `status`, the connection target and `password_source`, an `environment` snapshot, and `session_user` on success. The snapshot allowlists database settings, Secret Manager reference names, `CLOUD_SQL_CONNECTION_NAME`, `LOG_LEVEL`, `PORT`, and Cloud Run's `K_SERVICE`, `K_REVISION`, and `K_CONFIGURATION`. Unset variables are `null`; effective connection defaults (such as port `5432`) are shown in the connection target. `DB_PASSWORD_SET` reports only whether a password is configured. Passwords, tokens, and unrelated environment variables are never included in the snapshot.
+
+The debug action only connects and executes `SELECT session_user`; it does not read GCS/BigQuery or import, replace, or modify tables. HTTP 200 with `status: connected` means the query succeeded; HTTP 500 with `status: failed` includes the environment snapshot and a sanitized error type. See service logs for detailed errors. Cloud Run authentication and Invoker permission are still required.
+
+From the repository root in PowerShell, after deploying the updated app:
+
+```powershell
+$serviceUrl = gcloud run services describe gcs-to-postgresql-dev --project=jag-pgsql-gke --region=us-central1 --format="value(status.url)"
+$token = gcloud auth print-identity-token
+curl.exe -sS -X POST "$serviceUrl" -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data-binary "@dev_test_apps/smoke_tests/debug-request.json"
+```
+
+Normal import JSON requests continue to work without an `action`; `action: import` is also accepted. An unrecognized action returns HTTP 400. For debug requests no import parameters are required, and any supplied import fields are ignored. The example is a request body for HTTP clients, not an input for `local_import_smoke_test.py`, which expects an import result.
+
 `GET /connection-test` only connects to the configured database with the service's current environment values and runs `SELECT session_user`; it does not touch BigQuery or GCS. It returns HTTP 200 with `"status": "connected"` or HTTP 500 with `"status": "failed"` and the error. The response includes the host, port, database, user, and password source but never the password.
 
 ```sh

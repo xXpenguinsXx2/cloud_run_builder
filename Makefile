@@ -16,7 +16,7 @@ AR_REPOSITORY ?= cloud-run-source-deploy
 DEPLOY_ENV ?= dev
 DEPLOY_CONFIG := apps/$(APP)/deploy/$(DEPLOY_ENV).env
 
-ifneq ($(filter deploy release check-deploy,$(MAKECMDGOALS)),)
+ifneq ($(filter run deploy release check-deploy,$(MAKECMDGOALS)),)
 -include $(DEPLOY_CONFIG)
 endif
 
@@ -31,6 +31,8 @@ CLOUD_SQL_CONNECTION_NAME ?=
 RUN_TIMEOUT_SECONDS ?=
 comma := ,
 DEPLOY_ENV_VARS = $(strip $(RUN_ENV_VARS)$(if $(strip $(CLOUD_SQL_CONNECTION_NAME)),$(if $(strip $(RUN_ENV_VARS)),$(comma))CLOUD_SQL_CONNECTION_NAME=$(CLOUD_SQL_CONNECTION_NAME)))
+RUN_ARGS ?= -p 127.0.0.1:8080:8080
+LOCAL_ENV_ARGS = $(if $(strip $(DEPLOY_ENV_VARS)),--env "$(subst $(comma)," --env ",$(DEPLOY_ENV_VARS))")
 
 SERVICE_NAME ?= $(subst _,-,$(APP))-$(DEPLOY_ENV)
 LOCAL_IMAGE := $(APP):$(IMAGE_TAG)
@@ -39,16 +41,19 @@ APP_DIRS := $(foreach dir,$(wildcard apps/*),$(if $(wildcard $(dir)/Dockerfile),
 APP_NAMES := $(patsubst apps/%,%,$(APP_DIRS))
 BUILD_APP_TARGETS := $(addprefix build-app-,$(APP_NAMES))
 
-.PHONY: help list-apps build build-all push deploy release test test-deps check-project check-deploy $(BUILD_APP_TARGETS)
+.PHONY: help list-apps build build-all run push deploy release test test-deps check-project check-deploy $(BUILD_APP_TARGETS)
 
 help:
-	@echo "Targets: list-apps, build APP=name, build-all, push, deploy, release, test, test-deps"
+	@echo "Targets: list-apps, build APP=name, build-all, run APP=name [DEPLOY_ENV=dev] [RUN_ARGS=...], push, deploy, release, test, test-deps"
 
 list-apps:
 	@echo $(APP_NAMES)
 
 build:
 	docker build --tag "$(LOCAL_IMAGE)" "apps/$(APP)"
+
+run: build
+	docker run --rm $(LOCAL_ENV_ARGS) $(RUN_ARGS) "$(LOCAL_IMAGE)"
 
 build-all: $(BUILD_APP_TARGETS)
 

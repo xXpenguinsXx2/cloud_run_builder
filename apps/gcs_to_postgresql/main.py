@@ -55,6 +55,23 @@ EXPORT_DATE_PATTERN = re.compile(r"^\d{8}$")
 INSERT_BATCH_SIZE = 1000
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 CONNECTION_TEST_PATH = "/connection-test"
+DEBUG_ENVIRONMENT_KEYS = (
+    "DB_HOST",
+    "DB_PORT",
+    "DB_NAME",
+    "DB_USER",
+    "DB_SCHEMA",
+    "DB_CONNECT_TIMEOUT_SECONDS",
+    "DB_SECRET_NAME",
+    "DB_SECRET_PROJECT",
+    "DB_SECRET_VERSION",
+    "CLOUD_SQL_CONNECTION_NAME",
+    "LOG_LEVEL",
+    "PORT",
+    "K_SERVICE",
+    "K_REVISION",
+    "K_CONFIGURATION",
+)
 EXPORTS_PREFIX = "services/exports"
 
 
@@ -382,14 +399,19 @@ def get_password_source():
     return "access_token"
 
 
-def check_database_connection():
-    target = {
+def check_database_connection(*, include_environment: bool = False):
+    target: dict[str, object] = {
         "host": os.environ.get("DB_HOST", "").strip(),
         "port": os.environ.get("DB_PORT", "5432").strip(),
         "database": os.environ.get("DB_NAME", "").strip(),
         "user": os.environ.get("DB_USER", "").strip(),
         "password_source": get_password_source(),
     }
+    if include_environment:
+        target["environment"] = {
+            **{name: os.environ.get(name) for name in DEBUG_ENVIRONMENT_KEYS},
+            "DB_PASSWORD_SET": bool(os.environ.get("DB_PASSWORD")),
+        }
     try:
         with closing(get_database_connection()) as connection:
             cursor = connection.cursor()
@@ -397,13 +419,25 @@ def check_database_connection():
             session_user = cursor.fetchone()[0]
     except Exception as exc:
         logger.exception("PostgreSQL connection test failed")
-        return jsonify({"status": "failed", **target, "error": str(exc)}), 500
+        error = (
+            f"PostgreSQL connection test failed ({type(exc).__name__}); see service logs"
+            if include_environment
+            else str(exc)
+        )
+        return jsonify({"status": "failed", **target, "error": error}), 500
     return jsonify({"status": "connected", **target, "session_user": session_user}), 200
 
 
 def import_gcs_to_postgresql(request: Request):
     if request.path.rstrip("/") == CONNECTION_TEST_PATH:
         return check_database_connection()
+
+    body = request.get_json(silent=True)
+    if isinstance(body, dict) and "action" in body:
+        if body["action"] == "debug":
+            return check_database_connection(include_environment=True)
+        if body["action"] != "import":
+            return jsonify({"error": "unsupported action; expected debug or import"}), 400
 
     payload, validation_error = get_request_payload(request)
     if validation_error:

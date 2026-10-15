@@ -89,6 +89,8 @@ make -C dev_test_apps local-import-postgres-down
 
 The importer container mounts your host's `${APPDATA}/gcloud` directory read-only so it can use your Application Default Credentials — run `make -C dev_test_apps/smoke_tests auth-google-adc` first if the importer fails to authenticate to GCS/BigQuery.
 
+For a diagnostic POST instead of an import, send [smoke_tests/debug-request.json](smoke_tests/debug-request.json) to the importer service root. It reports safe runtime environment settings and tests PostgreSQL connectivity without accessing exports or changing tables. See the [remote debug request instructions](../apps/gcs_to_postgresql/README.md#connection-test) for an authenticated PowerShell command. Do not pass this debug request to the import-only smoke test runner.
+
 ## Ad-hoc Parquet querying (`postgres`)
 
 `postgres/` is a standalone PostgreSQL 14 image with the `parquet_fdw` foreign data wrapper and `gcsfuse` built in, for developers who want to run SQL directly against Parquet files (for example the Parquet exports produced by `bq_to_gcs`) without importing them into real tables first. This is a different workflow than `gcs_to_postgresql`'s import-and-replace approach — nothing here is imported or persisted as a normal table; you query the Parquet file in place through a foreign table.

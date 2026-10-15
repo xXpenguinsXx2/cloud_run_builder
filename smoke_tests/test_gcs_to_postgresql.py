@@ -1,4 +1,7 @@
 import io
+import json
+import os
+from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
@@ -179,6 +182,115 @@ class GcsToPostgresqlFunctionTests(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertEqual(response.get_json()["status"], "failed")
         self.assertEqual(response.get_json()["error"], "auth failed")
+
+    @patch("apps.gcs_to_postgresql.main.import_objects")
+    @patch("apps.gcs_to_postgresql.main.storage.Client")
+    @patch("apps.gcs_to_postgresql.main.bigquery.Client")
+    @patch("apps.gcs_to_postgresql.main.get_database_connection")
+    def test_debug_example_reports_environment_without_importing(
+        self, connection_factory, bigquery_factory, storage_factory, import_objects
+    ):
+        connection = connection_factory.return_value
+        connection.cursor.return_value.fetchone.return_value = ("app-user",)
+        example = (
+            Path(__file__).resolve().parents[1]
+            / "dev_test_apps" / "smoke_tests" / "debug-request.json"
+        )
+        with patch.dict(os.environ, {
+            "DB_HOST": "postgres.example",
+            "DB_NAME": "app",
+            "DB_USER": "app-user",
+            "DB_PASSWORD": "private-password",
+            "API_TOKEN": "private-token",
+            "K_REVISION": "importer-00001",
+        }, clear=True):
+            response, status = self.call_handler(json.loads(example.read_text()))
+
+        body = response.get_json()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "connected")
+        self.assertEqual(body["session_user"], "app-user")
+        self.assertEqual(body["environment"]["DB_HOST"], "postgres.example")
+        self.assertEqual(body["environment"]["K_REVISION"], "importer-00001")
+        self.assertIsNone(body["environment"]["DB_PORT"])
+        self.assertEqual(body["port"], "5432")
+        self.assertTrue(body["environment"]["DB_PASSWORD_SET"])
+        self.assertEqual(body["password_source"], "DB_PASSWORD")
+        self.assertNotIn("DB_PASSWORD", body["environment"])
+        self.assertNotIn("API_TOKEN", body["environment"])
+        self.assertNotIn("private-password", response.get_data(as_text=True))
+        self.assertNotIn("private-token", response.get_data(as_text=True))
+        connection.cursor.return_value.execute.assert_called_once_with("SELECT session_user")
+        connection.close.assert_called_once_with()
+        bigquery_factory.assert_not_called()
+        storage_factory.assert_not_called()
+        import_objects.assert_not_called()
+
+    @patch("apps.gcs_to_postgresql.main.get_database_connection")
+    def test_debug_failure_still_reports_environment_without_exception_secrets(
+        self, connection_factory
+    ):
+        connection_factory.side_effect = RuntimeError("password=private-password")
+        with patch.dict(os.environ, {"DB_HOST": "unreachable"}, clear=True):
+            response, status = self.call_handler({"action": "debug"})
+
+        body = response.get_json()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["environment"]["DB_HOST"], "unreachable")
+        self.assertFalse(body["environment"]["DB_PASSWORD_SET"])
+        self.assertIn("RuntimeError", body["error"])
+        self.assertNotIn("private-password", response.get_data(as_text=True))
+
+    @patch("apps.gcs_to_postgresql.main.get_database_connection")
+    def test_debug_query_failure_closes_connection(self, connection_factory):
+        connection = connection_factory.return_value
+        connection.cursor.return_value.execute.side_effect = RuntimeError("query failed")
+
+        response, status = self.call_handler({"action": "debug"})
+
+        self.assertEqual(status, 500)
+        self.assertEqual(response.get_json()["status"], "failed")
+        connection.close.assert_called_once_with()
+
+    @patch("apps.gcs_to_postgresql.main.get_database_connection")
+    @patch("apps.gcs_to_postgresql.main.storage.Client")
+    def test_unknown_action_is_rejected(self, storage_factory, connection_factory):
+        for action in ("deubg", "", None, [], {}):
+            with self.subTest(action=action):
+                response, status = self.call_handler({"action": action})
+                self.assertEqual(status, 400)
+                self.assertIn("unsupported action", response.get_json()["error"])
+        storage_factory.assert_not_called()
+        connection_factory.assert_not_called()
+
+    def test_explicit_import_action_still_requires_import_fields(self):
+        response, status = self.call_handler({"action": "import"})
+        self.assertEqual(status, 400)
+        self.assertIn("missing required parameter(s)", response.get_json()["error"])
+
+    @patch("apps.gcs_to_postgresql.main.import_objects")
+    @patch("apps.gcs_to_postgresql.main.storage.Client")
+    def test_debug_with_missing_configuration_does_not_fall_through_to_import(
+        self, storage_factory, import_objects
+    ):
+        with patch.dict(os.environ, {}, clear=True):
+            response, status = self.call_handler({
+                "action": "debug",
+                "source_project": "source-project",
+                "dataset_id": "dataset",
+                "table_id": "example",
+                "source_bucket": "bucket",
+                "format": "CSV",
+            })
+
+        body = response.get_json()
+        self.assertEqual(status, 500)
+        self.assertEqual(body["status"], "failed")
+        self.assertIsNone(body["environment"]["DB_HOST"])
+        self.assertIn("ValueError", body["error"])
+        storage_factory.assert_not_called()
+        import_objects.assert_not_called()
 
     def test_request_parser_rejects_multiple_wildcards(self):
         payload, error = get_request_payload(
