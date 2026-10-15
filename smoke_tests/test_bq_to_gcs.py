@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from flask import Flask, request
 
-APP_DIR = Path(__file__).resolve().parents[1] / "apps" / "bq_to_gcs_helpers"
+APP_DIR = Path(__file__).resolve().parents[1] / "apps" / "bq_to_gcs"
 sys.path.insert(0, str(APP_DIR))
 
 from main import append_history, export_table_to_gcs, get_latest_extract_time

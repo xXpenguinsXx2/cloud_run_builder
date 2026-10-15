@@ -41,7 +41,7 @@ load_app_config() {
 
   SERVICE_NAME="${SERVICE_NAME:-${app_name//_/-}-$deploy_environment}"
   # Optional: when empty, Cloud Run uses its default identity.
-  RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-}"
+  RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-${CLOUD_RUN_SERVICE_ACCOUNT:-}}"
   image_uri="$DEPLOY_REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPOSITORY/$SERVICE_NAME:$image_tag"
 }
 

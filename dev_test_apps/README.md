@@ -51,11 +51,11 @@ make -C dev_test_apps/smoke_tests test-deps   # first time only, or after requir
 make -C dev_test_apps/smoke_tests test
 ```
 
-## Export smoke tests (`bq_to_gcs_helpers`)
+## Export smoke tests (`bq_to_gcs`)
 
 These exercise the BigQuery-to-GCS export function, validating the configured dataset/table/location before triggering CSV and Parquet exports.
 
-**Local** — run the `bq_to_gcs_helpers` function locally first (see [../apps/bq_to_gcs_helpers/README.md](../apps/bq_to_gcs_helpers/README.md#run-locally-with-docker) for the `docker build`/`docker run` commands), then:
+**Local** — run the `bq_to_gcs` function locally first (see [../apps/bq_to_gcs/README.md](../apps/bq_to_gcs/README.md#run-locally-with-docker) for the `docker build`/`docker run` commands), then:
 
 ```bash
 make -C dev_test_apps smoke-test-export-local
@@ -71,7 +71,7 @@ make -C dev_test_apps smoke-test-export-remote
 
 This resolves the Cloud Run URL via `gcloud run services describe`, authenticates with a `gcloud auth print-identity-token` bearer token, and runs the same CSV/Parquet preflight-and-export checks against `example/cloud-run-export-*.csv` and `example/cloud-run-export-*.parquet` objects. Override `PROJECT_ID`, `REGION`, `SERVICE_NAME`, or `SOURCE_PROJECT` to match the environment you deployed to (see `smoke_tests/Makefile` for all overridable variables).
 
-## Local import workflow (`gcs_to_postgresql_helpers`)
+## Local import workflow (`gcs_to_postgresql`)
 
 Spins up a disposable PostgreSQL container plus a locally built copy of the importer, then imports the GCS objects produced by the export smoke tests:
 
@@ -79,7 +79,7 @@ Spins up a disposable PostgreSQL container plus a locally built copy of the impo
 make -C dev_test_apps local-import
 ```
 
-This runs `docker compose -f gcs_to_postgresql.compose.yaml up -d --build --wait` to start PostgreSQL on `localhost:5433` and the importer on `localhost:8081`, posts the CSV and Parquet import requests (`smoke_tests/import-request-csv.json` / `import-request-parquet.json`), and prints the resulting row counts for `public.example` and `public.parq_example`. The import requests point at the `example/cloud-run-export-*` objects written by `make -C dev_test_apps smoke-test-export-remote`; run that first if those objects don't exist yet.
+This runs `docker compose -f gcs_to_postgresql.compose.yaml up -d --build --wait` to start PostgreSQL on `localhost:5433` and the importer on `localhost:8081`, posts the CSV and Parquet import requests (`smoke_tests/import-request-csv.json` / `import-request-parquet.json`), and prints the resulting row counts for `public.example` and `public.parq_example`. The import requests omit `source_object`, so the importer picks the latest `services/exports/example/<YYYYMMDD>/` folder written by `bq_to_gcs`; run an export first if none exists yet.
 
 The PostgreSQL volume (`gcs_to_postgresql_postgres_data`) persists across runs so you can re-import without losing other local data. Tear the stack down with:
 
@@ -91,7 +91,7 @@ The importer container mounts your host's `${APPDATA}/gcloud` directory read-onl
 
 ## Ad-hoc Parquet querying (`postgres`)
 
-`postgres/` is a standalone PostgreSQL 14 image with the `parquet_fdw` foreign data wrapper and `gcsfuse` built in, for developers who want to run SQL directly against Parquet files (for example the Parquet exports produced by `bq_to_gcs_helpers`) without importing them into real tables first. This is a different workflow than `gcs_to_postgresql_helpers`'s import-and-replace approach — nothing here is imported or persisted as a normal table; you query the Parquet file in place through a foreign table.
+`postgres/` is a standalone PostgreSQL 14 image with the `parquet_fdw` foreign data wrapper and `gcsfuse` built in, for developers who want to run SQL directly against Parquet files (for example the Parquet exports produced by `bq_to_gcs`) without importing them into real tables first. This is a different workflow than `gcs_to_postgresql`'s import-and-replace approach — nothing here is imported or persisted as a normal table; you query the Parquet file in place through a foreign table.
 
 ```bash
 make -C dev_test_apps run DEV_TEST_APP=postgres

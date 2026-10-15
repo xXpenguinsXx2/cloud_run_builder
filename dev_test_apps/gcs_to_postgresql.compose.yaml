@@ -17,7 +17,7 @@ services:
 
   importer:
     build:
-      context: ../apps/gcs_to_postgresql_helpers
+      context: ../apps/gcs_to_postgresql
       dockerfile: Dockerfile
     environment:
       PORT: "8080"

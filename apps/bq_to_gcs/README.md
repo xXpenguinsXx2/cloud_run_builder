@@ -1,6 +1,6 @@
 # BigQuery → GCS exporter
 
-This private Cloud Run HTTP function exports a BigQuery table to a Cloud Storage bucket as CSV or Parquet. It supports a source table in a different GCP project than the project that hosts the service. `functions-framework` serves the handler over HTTP inside the container, the same pattern used by `apps/gcs_to_postgresql_helpers`.
+This private Cloud Run HTTP function exports a BigQuery table to a Cloud Storage bucket as CSV or Parquet. It supports a source table in a different GCP project than the project that hosts the service. `functions-framework` serves the handler over HTTP inside the container, the same pattern used by `apps/gcs_to_postgresql`.
 
 Request fields (JSON body or query parameters):
 
@@ -49,7 +49,7 @@ This app deploys the same way as every other app in `apps/`: with the root [Make
 Manual deploy from `cloud_run_builder`:
 
 ```bash
-make deploy APP=bq_to_gcs_helpers REGION=us-central1 \
+make deploy APP=bq_to_gcs REGION=us-central1 \
   IMAGE_TAG=dev RUNTIME_SERVICE_ACCOUNT=bq-export@YOUR_PROJECT.iam.gserviceaccount.com \
   PROJECT_ID=YOUR_PROJECT_ID
 ```

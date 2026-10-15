@@ -17,7 +17,7 @@ cloud_run_builder/
         prod.env
 ```
 
-Each environment file is sourced as a Bash file by the build scripts. It must set the runtime identity, and may override the service name or configure runtime environment variables and Secret Manager references:
+Each environment file is sourced by the Bash build scripts and included by the root Makefile for deployment. Use plain, unquoted `KEY=value` assignments compatible with both Bash and Make (no shell expansions); keep comma-separated runtime settings in a single `RUN_ENV_VARS` assignment rather than using `+=`. The file may set the runtime identity, override the service name, or configure runtime environment variables and Secret Manager references:
 
 ```bash
 SERVICE_NAME=reports-api-stage
@@ -30,20 +30,22 @@ Only apps with both a `Dockerfile` and the selected environment file are include
 
 ## Local wrapper commands
 
-Run these commands from `cloud_run_builder`. `APP` defaults to `bq_to_gcs_helpers`, `PROJECT_ID` defaults to `jag-pgsql-gke`, and `build-all` builds each app under `apps/` that has a Dockerfile. Dev/test container operations are handled only by the standalone Makefile under `dev_test_apps/`.
+Run these commands from `cloud_run_builder`. `APP` defaults to `gcs_to_postgresql`, `PROJECT_ID` defaults to `jag-pgsql-gke`, and `build-all` builds each app under `apps/` that has a Dockerfile. Dev/test container operations are handled only by the standalone Makefile under `dev_test_apps/`.
 
 ```bash
 make list-apps
 make build
-make build APP=bq_to_gcs_helpers IMAGE_TAG=local
+make build APP=bq_to_gcs IMAGE_TAG=local
 make build-all IMAGE_TAG=local
-make push APP=bq_to_gcs_helpers IMAGE_TAG=dev
-make deploy APP=bq_to_gcs_helpers REGION=us-central1 \
+make push APP=bq_to_gcs IMAGE_TAG=dev
+make deploy APP=bq_to_gcs REGION=us-central1 \
   IMAGE_TAG=dev RUNTIME_SERVICE_ACCOUNT=bq-export@jag-pgsql-gke.iam.gserviceaccount.com \
   RUN_SECRETS=API_TOKEN=api-token:latest
 ```
 
-`deploy` builds and pushes the selected image before deploying it. It keeps the service private and sets the runtime service account on Cloud Run. The `RUN_SECRETS` value contains Secret Manager references, not secret values. The runtime service account must have access to those secrets. `DEPLOY_ENV` defaults to `dev` and controls the default Cloud Run service name. Set `DEPLOY_ENV=stage` or `DEPLOY_ENV=prod` for manual stage/prod deployments.
+`deploy` builds and pushes the selected image before deploying it. `deploy`, `release`, and `check-deploy` automatically load `apps/<APP>/deploy/<DEPLOY_ENV>.env` when it exists, including `RUN_ENV_VARS`, `RUN_SECRETS`, `SERVICE_NAME`, and `RUN_TIMEOUT_SECONDS`. Explicit Make command-line assignments override the file. If no file exists, command-line values and defaults are used. The config is applied to the Cloud Run runtime, not baked into the image; editing it requires deploying a new revision. Use `make -n deploy APP=gcs_to_postgresql DEPLOY_ENV=dev` to preview the deployment without building or changing cloud resources.
+
+The service stays private. The runtime service account comes from `RUNTIME_SERVICE_ACCOUNT`, or `CLOUD_RUN_SERVICE_ACCOUNT` when no explicit account is configured; if neither is set, Cloud Run uses its default identity. The `RUN_SECRETS` value contains Secret Manager references, not secret values. The runtime service account must have access to those secrets. `DEPLOY_ENV` defaults to `dev`; set `DEPLOY_ENV=stage` or `DEPLOY_ENV=prod` for manual stage/prod deployments.
 
 `make test` runs the handler-level unit tests for every app (`smoke_tests/test_*.py`, fully mocked, no Google Cloud access required); run `make test-deps` first to install their dependencies. Don't confuse this top-level `smoke_tests/` directory with `dev_test_apps/smoke_tests/` below, which holds the live local/remote smoke test tooling.
 
@@ -63,11 +65,11 @@ make -C dev_test_apps local-import
 
 ## GCS to PostgreSQL importer
 
-`apps/gcs_to_postgresql_helpers/` contains a private Cloud Run HTTP function that imports CSV or Parquet GCS exports into PostgreSQL. It reads the source BigQuery schema, imports objects matching `destination_object`, and transactionally replaces `public.<table_id>` for CSV or `public.parq_<table_id>` for Parquet. It uses Cloud SQL IAM database authentication when `CLOUD_SQL_CONNECTION_NAME` is configured, and a direct TCP connection for local development.
+`apps/gcs_to_postgresql/` contains a private Cloud Run HTTP function that imports CSV or Parquet GCS exports into PostgreSQL. It loads the schema from the `<table_id>_schema.json` file that `bq_to_gcs` exports (falling back to BigQuery), imports the latest `services/exports/<table_id>/<YYYYMMDD>/` folder (or `export_date` / `source_object` when given), and transactionally replaces `public.<table_id>` for CSV or `public.parq_<table_id>` for Parquet. It connects directly to PostgreSQL (no SSL) using `DB_HOST`, `DB_PORT`, `DB_NAME`, and `DB_USER`, with the password taken from `DB_PASSWORD`, a Secret Manager secret (`DB_SECRET_NAME`), or the runtime identity's access token.
 
-For local testing (disposable PostgreSQL + importer via Docker Compose), authenticate with Google Application Default Credentials and see [dev_test_apps/README.md](dev_test_apps/README.md#local-import-workflow-gcs_to_postgresql_helpers) for the full `local-import` workflow.
+For local testing (disposable PostgreSQL + importer via Docker Compose), authenticate with Google Application Default Credentials and see [dev_test_apps/README.md](dev_test_apps/README.md#local-import-workflow-gcs_to_postgresql) for the full `local-import` workflow.
 
-Before deploying, replace the Cloud SQL connection name and database-name placeholders in the selected `apps/gcs_to_postgresql_helpers/deploy/<environment>.env` file. Enable the Cloud SQL Admin API and IAM database authentication, add the Cloud Run runtime service account as a Cloud SQL IAM database user, grant it Cloud SQL Client and Cloud SQL Instance User access, and grant that database user the schema/table privileges needed to replace the import tables. The deployment derives `DB_IAM_USER` from `RUNTIME_SERVICE_ACCOUNT` by stripping its `.gserviceaccount.com` suffix (the IAM database username format Cloud SQL expects), attaches the configured instance to Cloud Run, passes its connection name to the service, and sets a one-hour request timeout. Select `CLOUD_SQL_IP_TYPE=PRIVATE` and configure Cloud Run VPC connectivity if the instance is private-IP-only. Grant the runtime identity BigQuery Data Viewer and Storage Object Viewer on the source table and bucket.
+Before deploying, replace the `DB_HOST`/`DB_USER` placeholders (and optionally set `DB_SECRET_NAME`/`DB_SECRET_PROJECT`) in the selected `apps/gcs_to_postgresql/deploy/<environment>.env` file; see [the app README](apps/gcs_to_postgresql/README.md#database-connection-and-deployment). Grant the runtime identity BigQuery Data Viewer and Storage Object Viewer on the source table and bucket, Secret Manager Secret Accessor on the password secret when used, and grant the database user the schema/table privileges needed to replace the import tables. The deployment sets a one-hour request timeout.
 
 ## Cloud Build trigger
 
@@ -77,7 +79,7 @@ Create a Cloud Build trigger with:
 - Configuration file `cloudbuild.yaml` at the repository root.
 - Branch filters for `dev`, `stage`, `prod`, and `main` (or a broader filter if desired).
 - Substitutions `_REGION` and `_AR_REPOSITORY` set to the Artifact Registry location and Docker repository. Defaults are `us-central1` and `cloud-run-source-deploy`.
-- Substitution `_RUNTIME_SERVICE_ACCOUNT` optionally selects the Cloud Run runtime identity. It defaults to empty, in which case `--service-account` is omitted and Cloud Run uses its default identity; set it on the trigger to use a specific account. (The gcs_to_postgresql_helpers `DB_IAM_USER` is only set when it is provided.)
+- Substitution `_RUNTIME_SERVICE_ACCOUNT` optionally selects the Cloud Run runtime identity. It defaults to empty, in which case `--service-account` is omitted and Cloud Run uses its default identity; set it on the trigger to use a specific account.
 - A dedicated Cloud Build service account as the trigger's build identity.
 
 Branches `dev`, `stage`, and `prod` select the same-named app config. `main` selects `prod`. Other branches fail closed. The BigQuery-to-GCS production profile uses project `jag-pgsql-gke`, region `us-central1`, bucket `jag_bq_export_bucket`, and service `bigquery-gcs-export`; dataset and table remain request fields. Apps without a matching environment config are ignored; if no configured app is found, the build fails with a message. Images are tagged with the commit SHA and the deployed revision uses that exact tag.

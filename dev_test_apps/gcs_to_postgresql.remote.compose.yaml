@@ -1,7 +1,7 @@
 services:
   importer:
     build:
-      context: ../apps/gcs_to_postgresql_helpers
+      context: ../apps/gcs_to_postgresql
       dockerfile: Dockerfile
     environment:
       PORT: "8080"
@@ -10,9 +10,10 @@ services:
       DB_HOST: ${PG_DIRECT_HOST:?set PG_DIRECT_HOST}
       DB_PORT: ${PG_DIRECT_PORT:-5432}
       DB_NAME: ${PG_DB_NAME:?set PG_DB_NAME}
-      DB_USER: ${PG_DB_IAM_USER:?set PG_DB_IAM_USER}
-      DB_IAM_TOKEN_AUTH: "true"
-      DB_SSL: ${PG_DB_SSL:-true}
+      DB_USER: ${PG_DB_USER:?set PG_DB_USER}
+      DB_SECRET_NAME: ${PG_SECRET_NAME:-}
+      DB_SECRET_PROJECT: ${PG_SECRET_PROJECT:-}
+      DB_SECRET_VERSION: ${PG_SECRET_VERSION:-latest}
       DB_SCHEMA: ${PG_DB_SCHEMA:-public}
     volumes:
       - type: bind

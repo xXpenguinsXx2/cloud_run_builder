@@ -8,24 +8,29 @@ PYTHON ?= ../.venv/bin/python
 GCLOUD ?= gcloud
 endif
 
-APP ?= bq_to_gcs_helpers
+APP ?= gcs_to_postgresql
 PROJECT_ID ?= jag-pgsql-gke
 IMAGE_TAG ?= local
 REGION ?= us-central1
 AR_REPOSITORY ?= cloud-run-source-deploy
+DEPLOY_ENV ?= dev
+DEPLOY_CONFIG := apps/$(APP)/deploy/$(DEPLOY_ENV).env
+
+ifneq ($(filter deploy release check-deploy,$(MAKECMDGOALS)),)
+-include $(DEPLOY_CONFIG)
+endif
+
 # Optional. When empty, `gcloud run deploy` is run without --service-account and Cloud Run uses the
 # project's default runtime identity. Set explicitly to override, e.g.
 # `make deploy RUNTIME_SERVICE_ACCOUNT=name@project.iam.gserviceaccount.com`.
 # This is independent of cloudbuild.yaml's _RUNTIME_SERVICE_ACCOUNT trigger substitution.
-RUNTIME_SERVICE_ACCOUNT ?=
+RUNTIME_SERVICE_ACCOUNT ?= $(CLOUD_RUN_SERVICE_ACCOUNT)
 RUN_ENV_VARS ?=
 RUN_SECRETS ?=
 CLOUD_SQL_CONNECTION_NAME ?=
 RUN_TIMEOUT_SECONDS ?=
 comma := ,
 DEPLOY_ENV_VARS = $(strip $(RUN_ENV_VARS)$(if $(strip $(CLOUD_SQL_CONNECTION_NAME)),$(if $(strip $(RUN_ENV_VARS)),$(comma))CLOUD_SQL_CONNECTION_NAME=$(CLOUD_SQL_CONNECTION_NAME)))
-
-DEPLOY_ENV ?= dev
 
 SERVICE_NAME ?= $(subst _,-,$(APP))-$(DEPLOY_ENV)
 LOCAL_IMAGE := $(APP):$(IMAGE_TAG)
@@ -70,6 +75,7 @@ check-project:
     $(if $(strip $(PROJECT_ID)),,$(error PROJECT_ID is required, for example make push PROJECT_ID=my-project))
 
 check-deploy:
+	@echo [check-deploy] DEPLOY_CONFIG=$(if $(wildcard $(DEPLOY_CONFIG)),$(DEPLOY_CONFIG),(not found - using command-line values and defaults))
 	@echo [check-deploy] PROJECT_ID=$(PROJECT_ID)
 	@echo [check-deploy] DEPLOY_ENV=$(DEPLOY_ENV)
 	@echo [check-deploy] SERVICE_NAME=$(SERVICE_NAME)

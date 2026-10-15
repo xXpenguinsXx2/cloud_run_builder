@@ -1,13 +1,19 @@
+import base64
 import csv
 import fnmatch
+import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from contextlib import closing
 from pathlib import Path
 
 from flask import Request, jsonify
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import Request as AuthRequest
 from google.cloud import bigquery, storage
 import pg8000
 import pyarrow.parquet as parquet
@@ -38,14 +44,18 @@ POSTGRES_TYPES = {
     "JSON": "JSONB",
 }
 REQUIRED_FIELDS = (
-    "sink_project",
-    "sink_dataset_id",
-    "sink_table_id",
-    "target_import_bucket",
-    "destination_object",
+    "source_project",
+    "dataset_id",
+    "table_id",
+    "source_bucket",
     "format",
 )
+FORMAT_EXTENSIONS = {"CSV": "csv", "PARQUET": "parquet"}
+EXPORT_DATE_PATTERN = re.compile(r"^\d{8}$")
 INSERT_BATCH_SIZE = 1000
+CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+CONNECTION_TEST_PATH = "/connection-test"
+EXPORTS_PREFIX = "services/exports"
 
 
 def quote_identifier(value):
@@ -69,11 +79,54 @@ def get_request_payload(request: Request):
     if export_format not in ("CSV", "PARQUET"):
         return None, "unsupported format; expected CSV or PARQUET"
 
-    object_pattern = payload["destination_object"]
-    if object_pattern.count("*") > 1:
-        return None, "destination_object may contain at most one '*' wildcard"
+    for optional_field in ("source_object", "export_date"):
+        value = payload.get(optional_field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            return None, f"{optional_field} must be a non-empty string when provided"
+
+    source_object = payload.get("source_object")
+    if source_object and source_object.count("*") > 1:
+        return None, "source_object may contain at most one '*' wildcard"
+
+    export_date = payload.get("export_date")
+    if export_date and not EXPORT_DATE_PATTERN.match(export_date.strip()):
+        return None, "export_date must be in YYYYMMDD format"
 
     return {**payload, "format": export_format}, None
+
+
+def resolve_source_object(storage_client, payload):
+    """Return the object pattern to import.
+
+    Uses source_object when given; otherwise the bq_to_gcs export folder
+    services/exports/<table_id>/<export_date or latest YYYYMMDD>/part_*.<ext>.
+    """
+    if payload.get("source_object"):
+        return payload["source_object"]
+
+    table_id = payload["table_id"]
+    extension = FORMAT_EXTENSIONS[payload["format"]]
+    table_prefix = f"{EXPORTS_PREFIX}/{table_id}/"
+
+    export_date = (payload.get("export_date") or "").strip()
+    if not export_date:
+        part_pattern = re.compile(
+            re.escape(table_prefix) + r"(\d{8})/part_[^/]*\." + re.escape(extension) + "$"
+        )
+        export_dates = {
+            match.group(1)
+            for blob in storage_client.list_blobs(payload["source_bucket"], prefix=table_prefix)
+            if (match := part_pattern.match(blob.name))
+        }
+        if not export_dates:
+            raise ValueError(
+                f"no {payload['format']} exports found under "
+                f"gs://{payload['source_bucket']}/{table_prefix}"
+            )
+        export_date = max(export_dates)
+        logger.info("Using latest export folder %s%s/", table_prefix, export_date)
+
+    return f"{table_prefix}{export_date}/part_*.{extension}"
 
 
 def get_matching_blobs(storage_client, bucket_name, object_pattern):
@@ -88,6 +141,43 @@ def get_matching_blobs(storage_client, bucket_name, object_pattern):
         )
     ]
     return sorted(blobs, key=lambda blob: blob.name)
+
+
+def get_schema_object_name(payload):
+    """Schema file written by bq_to_gcs next to the table's export folders."""
+    override = payload.get("schema_object")
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    table_id = payload["table_id"]
+    return f"{EXPORTS_PREFIX}/{table_id}/{table_id}_schema.json"
+
+
+def load_schema(storage_client, payload):
+    """Return (schema, source) from the exported schema.json, else BigQuery."""
+    bucket_name = payload["source_bucket"]
+    schema_object = get_schema_object_name(payload)
+    blob = storage_client.bucket(bucket_name).get_blob(schema_object)
+    if blob is not None:
+        fields = json.loads(blob.download_as_text())
+        if not isinstance(fields, list):
+            raise ValueError(f"gs://{bucket_name}/{schema_object} must contain a JSON list of fields")
+        logger.info("Using exported schema gs://%s/%s", bucket_name, schema_object)
+        return (
+            [bigquery.SchemaField.from_api_repr(field) for field in fields],
+            f"gs://{bucket_name}/{schema_object}",
+        )
+
+    source_table_id = (
+        f"{payload['source_project']}.{payload['dataset_id']}.{payload['table_id']}"
+    )
+    logger.warning(
+        "Schema file gs://%s/%s not found; reading schema from BigQuery table %s",
+        bucket_name,
+        schema_object,
+        source_table_id,
+    )
+    source_table = bigquery.Client(project=payload["source_project"]).get_table(source_table_id)
+    return source_table.schema, f"bigquery:{source_table_id}"
 
 
 def get_table_columns(schema):
@@ -118,78 +208,62 @@ def get_table_columns(schema):
     return columns
 
 
-def get_database_connection():
-    connection_name = os.environ.get("CLOUD_SQL_CONNECTION_NAME", "").strip()
-    database = os.environ.get("DB_NAME", "").strip()
-    if connection_name:
-        iam_user = os.environ.get("DB_IAM_USER", "").strip()
-        if not database or not iam_user:
-            raise ValueError(
-                "DB_NAME and DB_IAM_USER are required with "
-                "CLOUD_SQL_CONNECTION_NAME"
-            )
+def read_secret(name, project, version="latest"):
+    """Return a Secret Manager secret value using Application Default Credentials."""
+    if name.startswith("projects/"):
+        resource = name.split("/versions/")[0]
+    elif project:
+        resource = f"projects/{project}/secrets/{name}"
+    else:
+        raise ValueError("DB_SECRET_PROJECT is required unless DB_SECRET_NAME is a full projects/... name")
+    credentials, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
+    response = AuthorizedSession(credentials).get(
+        f"https://secretmanager.googleapis.com/v1/{resource}/versions/{version}:access",
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Secret Manager HTTP {response.status_code}: {response.text[:200]}"
+        )
+    return base64.b64decode(response.json()["payload"]["data"]).decode("utf-8").strip()
 
-        from google.cloud.sql.connector import Connector, IPTypes
 
-        ip_type = os.environ.get("CLOUD_SQL_IP_TYPE", "PUBLIC").strip().upper()
-        if ip_type not in ("PUBLIC", "PRIVATE"):
-            raise ValueError("CLOUD_SQL_IP_TYPE must be PUBLIC or PRIVATE")
-        connector = Connector()
-        try:
-            connection = connector.connect(
-                connection_name,
-                "pg8000",
-                user=iam_user,
-                db=database,
-                enable_iam_auth=True,
-                ip_type=IPTypes.PUBLIC if ip_type == "PUBLIC" else IPTypes.PRIVATE,
-            )
-        except Exception:
-            connector.close()
-            raise
-        return connection, connector
+def get_access_token():
+    """Return an OAuth access token for the runtime identity (IAM database auth)."""
+    credentials, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
+    credentials.refresh(AuthRequest())
+    return credentials.token
 
-    host = os.environ.get("DB_HOST", "").strip()
-    user = os.environ.get("DB_USER", "").strip()
+
+def get_database_password():
     password = os.environ.get("DB_PASSWORD", "")
-    ssl_context = None
-    if os.environ.get("DB_IAM_TOKEN_AUTH", "").strip().lower() in ("1", "true", "yes"):
-        # Manual IAM database authentication: an OAuth access token is the password.
-        import ssl
-
-        import google.auth
-        from google.auth.transport.requests import Request as AuthRequest
-
-        credentials, _ = google.auth.default(
-            scopes=[
-                "https://www.googleapis.com/auth/cloud-platform",
-                "https://www.googleapis.com/auth/sqlservice.login",
-            ]
+    if password:
+        return password
+    secret_name = os.environ.get("DB_SECRET_NAME", "").strip()
+    if secret_name:
+        return read_secret(
+            secret_name,
+            os.environ.get("DB_SECRET_PROJECT", "").strip(),
+            os.environ.get("DB_SECRET_VERSION", "").strip() or "latest",
         )
-        credentials.refresh(AuthRequest())
-        password = credentials.token
-        # DB_SSL=false for hosts that terminate TLS elsewhere (e.g. Cloud SQL
-        # Auth Proxy), which refuse the SSL request from the client.
-        if os.environ.get("DB_SSL", "true").strip().lower() not in ("0", "false", "no"):
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-    if not host or not database or not user or not password:
-        raise ValueError(
-            "DB_HOST, DB_NAME, DB_USER, and DB_PASSWORD are required for "
-            "a direct PostgreSQL connection"
-        )
-    return (
-        pg8000.connect(
-            host=host,
-            port=int(os.environ.get("DB_PORT", "5432")),
-            database=database,
-            user=user,
-            password=password,
-            timeout=float(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "15")),
-            ssl_context=ssl_context,
-        ),
-        None,
+    return get_access_token()
+
+
+def get_database_connection():
+    settings = {
+        name: os.environ.get(name, "").strip()
+        for name in ("DB_HOST", "DB_NAME", "DB_USER")
+    }
+    missing = [name for name, value in settings.items() if not value]
+    if missing:
+        raise ValueError(f"missing required environment variable(s): {', '.join(missing)}")
+    return pg8000.connect(
+        host=settings["DB_HOST"],
+        port=int(os.environ.get("DB_PORT", "5432")),
+        database=settings["DB_NAME"],
+        user=settings["DB_USER"],
+        password=get_database_password(),
+        timeout=float(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "15")),
     )
 
 
@@ -300,15 +374,45 @@ def import_objects(
     return imported_rows
 
 
+def get_password_source():
+    if os.environ.get("DB_PASSWORD", ""):
+        return "DB_PASSWORD"
+    if os.environ.get("DB_SECRET_NAME", "").strip():
+        return "secret_manager"
+    return "access_token"
+
+
+def check_database_connection():
+    target = {
+        "host": os.environ.get("DB_HOST", "").strip(),
+        "port": os.environ.get("DB_PORT", "5432").strip(),
+        "database": os.environ.get("DB_NAME", "").strip(),
+        "user": os.environ.get("DB_USER", "").strip(),
+        "password_source": get_password_source(),
+    }
+    try:
+        with closing(get_database_connection()) as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT session_user")
+            session_user = cursor.fetchone()[0]
+    except Exception as exc:
+        logger.exception("PostgreSQL connection test failed")
+        return jsonify({"status": "failed", **target, "error": str(exc)}), 500
+    return jsonify({"status": "connected", **target, "session_user": session_user}), 200
+
+
 def import_gcs_to_postgresql(request: Request):
+    if request.path.rstrip("/") == CONNECTION_TEST_PATH:
+        return check_database_connection()
+
     payload, validation_error = get_request_payload(request)
     if validation_error:
         return jsonify({"error": validation_error}), 400
 
     table_name = (
-        f"parq_{payload['sink_table_id']}"
+        f"parq_{payload['table_id']}"
         if payload["format"] == "PARQUET"
-        else payload["sink_table_id"]
+        else payload["table_id"]
     )
     schema_name = os.environ.get("DB_SCHEMA", "public").strip()
     if not schema_name:
@@ -317,41 +421,33 @@ def import_gcs_to_postgresql(request: Request):
         return jsonify(
             {"error": "destination schema and table names must be at most 63 bytes"}
         ), 400
-    connector = None
     connection = None
     try:
-        source_table_id = (
-            f"{payload['sink_project']}."
-            f"{payload['sink_dataset_id']}."
-            f"{payload['sink_table_id']}"
-        )
+        storage_client = storage.Client(project=payload["source_project"])
+        payload = {**payload, "source_object": resolve_source_object(storage_client, payload)}
         logger.info(
-            "Loading schema for %s before importing %s objects from gs://%s/%s",
-            source_table_id,
+            "Loading schema before importing %s objects from gs://%s/%s",
             payload["format"],
-            payload["target_import_bucket"],
-            payload["destination_object"],
+            payload["source_bucket"],
+            payload["source_object"],
         )
-        source_table = bigquery.Client(
-            project=payload["sink_project"]
-        ).get_table(source_table_id)
-        columns = get_table_columns(source_table.schema)
-        column_names = [field.name for field in source_table.schema]
+        schema, schema_source = load_schema(storage_client, payload)
+        columns = get_table_columns(schema)
+        column_names = [field.name for field in schema]
 
-        storage_client = storage.Client(project=payload["sink_project"])
         blobs = get_matching_blobs(
             storage_client,
-            payload["target_import_bucket"],
-            payload["destination_object"],
+            payload["source_bucket"],
+            payload["source_object"],
         )
         if not blobs:
             raise ValueError(
                 "no GCS objects match "
-                f"gs://{payload['target_import_bucket']}/"
-                f"{payload['destination_object']}"
+                f"gs://{payload['source_bucket']}/"
+                f"{payload['source_object']}"
             )
 
-        connection, connector = get_database_connection()
+        connection = get_database_connection()
         imported_rows = import_objects(
             connection,
             schema_name,
@@ -373,14 +469,15 @@ def import_gcs_to_postgresql(request: Request):
                 {
                     "status": "success",
                     "source": (
-                        f"gs://{payload['target_import_bucket']}/"
-                        f"{payload['destination_object']}"
+                        f"gs://{payload['source_bucket']}/"
+                        f"{payload['source_object']}"
                     ),
                     "imported": (
-                        f"{payload['sink_project']}:{payload['sink_dataset_id']}."
-                        f"{payload['sink_table_id']}"
+                        f"{payload['source_project']}:{payload['dataset_id']}."
+                        f"{payload['table_id']}"
                     ),
                     "table": f"{schema_name}.{table_name}",
+                    "schema_source": schema_source,
                     "format": payload["format"],
                     "objects": len(blobs),
                     "rows": imported_rows,
@@ -395,8 +492,6 @@ def import_gcs_to_postgresql(request: Request):
     finally:
         if connection is not None:
             connection.close()
-        if connector is not None:
-            connector.close()
 
 
 if __name__ == "__main__":
@@ -405,6 +500,7 @@ if __name__ == "__main__":
     app = Flask(__name__)
 
     @app.route("/", methods=["POST"])
+    @app.route(CONNECTION_TEST_PATH, methods=["GET", "POST"])
     def _root():
         return import_gcs_to_postgresql(request)
 

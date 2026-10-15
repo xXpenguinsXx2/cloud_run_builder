@@ -39,8 +39,9 @@ help:
 	@echo "smoke-test-export-local checks local readiness and the BigQuery dataset/table, then exports CSV and Parquet."
 	@echo "smoke-test-export-remote checks the BigQuery dataset/table, then exports CSV and Parquet via deployed Cloud Run."
 	@echo "local-import-postgres-up starts local PostgreSQL and the GCS importer at localhost:5433 and localhost:8081."
-	@echo "remote-import runs the importer in Docker against the real Cloud SQL host (direct connection, IAM token as password, SSL)."
-	@echo "  Requires PG_DIRECT_HOST, PG_DB_NAME, PG_DB_IAM_USER (optional PG_DIRECT_PORT, PG_DB_SCHEMA); remote-import-down stops it."
+	@echo "remote-import runs the importer in Docker against the real Cloud SQL host (direct connection, no SSL)."
+	@echo "  Requires PG_DIRECT_HOST, PG_DB_NAME, PG_DB_USER; password from PG_SECRET_NAME/PG_SECRET_PROJECT if set, else an ADC access token."
+	@echo "  Optional PG_DIRECT_PORT, PG_SECRET_VERSION, PG_DB_SCHEMA; remote-import-down stops it."
 	@echo "local-import triggers CSV and Parquet imports from the configured GCS requests into the local PostgreSQL container."
 
 list:
